@@ -13,11 +13,9 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from temporalio import activity
 
-try:
-    from settings import settings as _settings
-    DATABASE_URL = os.environ.get("DATABASE_URL", _settings.database_url)
-except ImportError:
-    DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://zovark:hydra_dev_2026@pgbouncer:5432/zovark")
+# stabilize-runtime-hygiene: centralized DB URL via settings.
+from settings import settings as _settings
+DATABASE_URL = os.environ.get("DATABASE_URL", _settings.database_url)
 
 
 def _get_db():
@@ -57,13 +55,33 @@ async def apply_governance(data: dict) -> dict:
     Input: assess output dict + tenant_id + task_type
     Returns: same dict with needs_human_review and review_reason added
     """
-    # OTEL span
+    # OTEL span — audit 2.17: guarantee .end() runs on every exit path via a
+    # refcount-bound guard (same pattern as assess.py).
+    class _SpanGuard:
+        __slots__ = ("span", "done")
+
+        def __init__(self, s):
+            self.span = s
+            self.done = False
+
+        def finish(self):
+            if self.span is not None and not self.done:
+                self.done = True
+                try:
+                    self.span.end()
+                except Exception:
+                    pass
+
+        def __del__(self):
+            self.finish()
+
     try:
         from tracing import get_tracer
         _span = get_tracer().start_span("stage.govern")
         _span.set_attribute("zovark.task_type", data.get("task_type", ""))
     except Exception:
         _span = None
+    _span_guard = _SpanGuard(_span)  # noqa: F841
 
     tenant_id = data.get("tenant_id", "")
     task_type = data.get("task_type", "")
@@ -100,8 +118,8 @@ async def apply_governance(data: dict) -> dict:
         try:
             _span.set_attribute("governance.autonomy_level", autonomy)
             _span.set_attribute("governance.needs_review", data.get("needs_human_review", True))
-            _span.end()
         except Exception:
             pass
+    _span_guard.finish()
 
     return data

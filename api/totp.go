@@ -266,12 +266,17 @@ func totpVerifyHandler(c *gin.Context) {
 }
 
 // checkTOTP verifies the TOTP code during login when 2FA is enabled.
-// Returns true if TOTP is not enabled or code is valid.
-func checkTOTP(userID, totpCode string) (bool, error) {
+// Returns true if TOTP is not enabled or code is valid. Accepts a context so
+// the request lifetime can cancel the DB query (originally used
+// context.Background, which made tracing/cancellation impossible).
+func checkTOTP(ctx context.Context, userID, totpCode string) (bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var secret *string
 	var totpEnabled bool
 
-	err := dbPool.QueryRow(context.Background(),
+	err := dbPool.QueryRow(ctx,
 		"SELECT totp_secret, totp_enabled FROM users WHERE id = $1", userID,
 	).Scan(&secret, &totpEnabled)
 	if err != nil {

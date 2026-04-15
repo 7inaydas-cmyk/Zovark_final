@@ -80,10 +80,17 @@ When the LLM is unavailable: Path A (saved plans) + benign routing continue norm
 ## 3. How to Start the System
 
 ```bash
+# 0. Populate .env — REQUIRED (stabilize-runtime-hygiene, 2026-04-15)
+#    docker-compose.yml and Pydantic settings both fail-fast on missing creds.
+#    `docker compose up -d` with an empty env will exit non-zero and name the
+#    first missing variable. Copy .env.example and fill in every placeholder.
+cp .env.example .env
+# ...edit .env, replace every REPLACE_ME_* value...
+
 # 1. Start core services
 docker compose up -d
 
-# 2. Start inference (llama-server + Nemotron-Mini-4B)
+# 2. Start inference (llama-server + Gemma 4 E4B)
 docker compose -f docker-compose.yml -f docker-compose.distroless.yml up -d zovark-inference
 
 # 3. Wait ~60s for model load, then verify
@@ -93,6 +100,11 @@ cmd/zvadmin/zvadmin.exe diagnose    # Full 8-check diagnostic
 ```
 
 ### Credentials
+
+> **stabilize-runtime-hygiene (2026-04-15):** dev credentials below are the
+> long-standing non-rotated defaults that must be set explicitly in `.env` —
+> they are no longer provided as compose fallbacks. Production deployments
+> MUST override every value via a secrets manager.
 
 | Resource | Credential |
 |----------|------------|

@@ -69,9 +69,9 @@ INJECTION_PATTERNS = [
     r'(?:\\[0-7]{1,3}){3,}',
     # Known malicious base64 payloads
     r'aWdub3JlIHByZXZpb3VzIGluc3RydWN0aW9ucw==',
-    # Tenant UUID injection patterns (test harness specific)
-    r'tenant-uuid-\d+',
-    r'other-tenant-uuid-\d+',
+    # Audit 2.20: removed production patterns `tenant-uuid-\d+` and
+    # `other-tenant-uuid-\d+` — they are test-harness markers and would
+    # corrupt any production log containing the literal string.
 ]
 
 MAX_FIELD_LENGTH = 10_000
@@ -160,10 +160,13 @@ def _scan_field_tail(value: str) -> bool:
     """
     Check the tail of long fields for hidden content.
     Attackers pad benign data then append injection near the truncation boundary.
+
+    Audit 2.21: widen tail window from 200 → 1024 characters. A 200-char window
+    is trivially evaded by offsetting the payload 201 chars from the end.
     """
     if len(value) < 1000:
         return False
-    tail = value[-200:]
+    tail = value[-1024:]
     for pattern in INJECTION_PATTERNS:
         if re.search(pattern, tail):
             return True
@@ -194,7 +197,12 @@ _HOMOGLYPH_MAP = str.maketrans({
 
 
 def _normalize_for_scanning(text: str) -> str:
-    """Normalize Unicode to catch homoglyph and zero-width character attacks."""
+    """Normalize Unicode to catch homoglyph and zero-width character attacks.
+
+    This returns a SCAN-ONLY copy used for pattern matching. The stored field
+    must keep the original user-supplied text — see sanitize_siem_event() for
+    the audit 2.19 change that preserves forensic evidence.
+    """
     # Remove zero-width characters
     text = text.replace('\u200b', '').replace('\u200c', '').replace('\u200d', '').replace('\ufeff', '').replace('\u00ad', '')
     # Remove right-to-left override
@@ -216,16 +224,20 @@ def sanitize_siem_event(event: dict) -> dict:
 
     for key, value in event.items():
         if isinstance(value, str):
-            # Normalize Unicode BEFORE pattern matching to catch homoglyphs
-            # AND apply to the actual value to strip zero-width chars and homoglyphs
-            value = _normalize_for_scanning(value)
-            scan_value = value
+            # Audit 2.19: NFKC normalization collapses legitimate characters
+            # (① → 1, ㎡ → m2, half/full-width kana), which corrupted forensic
+            # evidence shown to analysts. Keep the original value for storage,
+            # use scan_value only for pattern matching.
+            scan_value = _normalize_for_scanning(value)
 
-            # Check injection patterns on normalized value BEFORE truncation
+            # Check injection patterns on normalized scan copy BEFORE truncation.
+            # When a pattern hits, replace the match IN-PLACE on the normalized
+            # form (so the sanitizer's output still removes the injection).
             for pattern in INJECTION_PATTERNS:
                 if re.search(pattern, scan_value):
                     injection_detected = True
                     value = re.sub(pattern, '[INJECTION_STRIPPED]', value)
+                    scan_value = re.sub(pattern, '[INJECTION_STRIPPED]', scan_value)
                     logger.warning(f"Prompt injection pattern stripped from field: {key}")
 
             # Surgical stripping for JNDI/EL — remove delimiters but preserve content

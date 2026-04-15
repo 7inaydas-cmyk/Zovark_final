@@ -48,7 +48,10 @@ spec:
                   name: zovark-api-secrets
                   key: litellm-master-key
             - name: REDIS_URL
-              value: "redis://:hydra-redis-dev-2026@redis:6379/0"  # FIX #13
+              valueFrom:
+                secretKeyRef:
+                  name: zovark-worker-secrets
+                  key: redis-url
             - name: ZOVARK_LLM_MODEL
               value: "fast"
             - name: PYTHONUNBUFFERED

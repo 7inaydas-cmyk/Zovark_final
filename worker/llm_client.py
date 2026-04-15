@@ -90,8 +90,35 @@ def sync_llm_chat(**kwargs) -> dict:
 _client: httpx.AsyncClient | None = None
 # AsyncClient must not be reused across different event loops (e.g. repeated asyncio.run in tests).
 _client_loop_id: int | None = None
-_fast_semaphore = asyncio.Semaphore(1)  # FAST role: tool selection, param fill
-_code_semaphore = asyncio.Semaphore(1)  # CODE role: assessment, summary
+
+# Audit 2.8: semaphores MUST be bound to the running event loop, not a module-
+# import-time loop. Eagerly constructing `asyncio.Semaphore(1)` at import time
+# binds to whatever loop is current during import — which on Temporal worker
+# startup is NOT the loop that eventually runs the activity. Python 3.10+
+# raises "got Future attached to a different loop" in that case. Fix: lazy
+# construction inside llm_request(), rebound whenever the running loop changes.
+_fast_semaphore: asyncio.Semaphore | None = None
+_code_semaphore: asyncio.Semaphore | None = None
+_semaphore_loop_id: int | None = None
+
+
+def _get_role_semaphore(role: str) -> asyncio.Semaphore:
+    """Return the FAST/CODE semaphore bound to the current running loop."""
+    global _fast_semaphore, _code_semaphore, _semaphore_loop_id
+    cur_id: int | None = None
+    try:
+        cur_id = id(asyncio.get_running_loop())
+    except RuntimeError:
+        cur_id = None
+    if (
+        _fast_semaphore is None
+        or _code_semaphore is None
+        or (cur_id is not None and _semaphore_loop_id != cur_id)
+    ):
+        _fast_semaphore = asyncio.Semaphore(1)
+        _code_semaphore = asyncio.Semaphore(1)
+        _semaphore_loop_id = cur_id
+    return _code_semaphore if role in ("verdict", "summary") else _fast_semaphore
 
 # Per-role sampling configs (Agent 4)
 SAMPLING_CONFIGS = {
@@ -319,9 +346,8 @@ async def llm_request(
     chat_url = (endpoint_url or "").strip() or _default_chat_endpoint()
     auth_key = resolve_llm_api_key(api_key)
 
-    # Select semaphore based on role
-    is_code_role = role in ("verdict", "summary")
-    sem = _code_semaphore if is_code_role else _fast_semaphore
+    # Select semaphore based on role (lazy, loop-bound — audit 2.8)
+    sem = _get_role_semaphore(role)
 
     # Merge role-based sampling config
     sampling = SAMPLING_CONFIGS.get(role, SAMPLING_CONFIGS["tool_select"])

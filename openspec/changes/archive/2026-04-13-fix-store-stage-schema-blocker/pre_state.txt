@@ -1,0 +1,77 @@
+=== schema_migrations rows ===
+          filename          |       applied_at       |         applied_by         |  source  | checksum 
+----------------------------+------------------------+----------------------------+----------+----------
+ 040_human_review_flags.sql | 2026-01-01 00:00:00+00 | init_sql_freeze_2026-04-13 | init_sql | 
+ 046_llm_audit_log.sql      | 2026-01-01 00:00:00+00 | init_sql_freeze_2026-04-13 | init_sql | 
+(2 rows)
+
+
+=== \d agent_tasks ===
+                                      Table "public.agent_tasks"
+        Column        |           Type           | Collation | Nullable |           Default            
+----------------------+--------------------------+-----------+----------+------------------------------
+ id                   | uuid                     |           | not null | uuid_generate_v4()
+ tenant_id            | uuid                     |           | not null | 
+ user_id              | uuid                     |           |          | 
+ persona_id           | uuid                     |           |          | 
+ task_type            | character varying(100)   |           | not null | 
+ input                | jsonb                    |           | not null | '{}'::jsonb
+ output               | jsonb                    |           |          | 
+ status               | character varying(50)    |           | not null | 'pending'::character varying
+ error_message        | text                     |           |          | 
+ workflow_id          | character varying(255)   |           |          | 
+ workflow_run_id      | character varying(255)   |           |          | 
+ skill_id             | uuid                     |           |          | 
+ tokens_used_input    | integer                  |           | not null | 0
+ tokens_used_output   | integer                  |           | not null | 0
+ execution_ms         | integer                  |           |          | 
+ sandbox_container_id | character varying(255)   |           |          | 
+ severity             | character varying(20)    |           |          | 
+ worker_id            | character varying(255)   |           |          | 
+ started_at           | timestamp with time zone |           |          | 
+ completed_at         | timestamp with time zone |           |          | 
+ created_at           | timestamp with time zone |           | not null | now()
+ updated_at           | timestamp with time zone |           | not null | now()
+ path_taken           | text                     |           |          | 
+ generated_code       | text                     |           |          | 
+ trace_id             | uuid                     |           |          | 
+ dedup_count          | integer                  |           |          | 0
+ raw_input            | jsonb                    |           |          | 
+ dedup_hash           | text                     |           |          | 
+Indexes:
+    "agent_tasks_pkey" PRIMARY KEY, btree (id)
+    "idx_agent_tasks_blocked" btree (tenant_id, status) WHERE status::text = 'blocked_credentials'::text
+    "idx_agent_tasks_dedup_hash" btree (dedup_hash) WHERE dedup_hash IS NOT NULL
+    "idx_agent_tasks_path_verdict" btree (path_taken, (output ->> 'verdict'::text)) WHERE path_taken = 'C'::text
+    "idx_agent_tasks_tenant_status" btree (tenant_id, status)
+    "idx_agent_tasks_trace_id" btree (trace_id)
+    "idx_agent_tasks_workflow" btree (workflow_id)
+Check constraints:
+    "agent_tasks_status_check" CHECK (status::text = ANY (ARRAY['pending'::character varying, 'planning'::character varying, 'approved'::character varying, 'executing'::character varying, 'completed'::character varying, 'failed'::character varying, 'cancelled'::character varying, 'awaiting_approval'::character varying, 'rejected'::character varying]::text[]))
+Foreign-key constraints:
+    "agent_tasks_persona_id_fkey" FOREIGN KEY (persona_id) REFERENCES agent_personas(id)
+    "agent_tasks_skill_id_fkey" FOREIGN KEY (skill_id) REFERENCES agent_skills(id)
+    "agent_tasks_tenant_id_fkey" FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
+    "agent_tasks_user_id_fkey" FOREIGN KEY (user_id) REFERENCES users(id)
+Referenced by:
+    TABLE "agent_memory_episodic" CONSTRAINT "agent_memory_episodic_task_id_fkey" FOREIGN KEY (task_id) REFERENCES agent_tasks(id)
+    TABLE "agent_task_steps" CONSTRAINT "agent_task_steps_task_id_fkey" FOREIGN KEY (task_id) REFERENCES agent_tasks(id) ON DELETE CASCADE
+    TABLE "approval_requests" CONSTRAINT "approval_requests_task_id_fkey" FOREIGN KEY (task_id) REFERENCES agent_tasks(id) ON DELETE CASCADE
+    TABLE "investigation_memory" CONSTRAINT "investigation_memory_task_id_fkey" FOREIGN KEY (task_id) REFERENCES agent_tasks(id)
+    TABLE "investigation_steps" CONSTRAINT "investigation_steps_task_id_fkey" FOREIGN KEY (task_id) REFERENCES agent_tasks(id) ON DELETE CASCADE
+    TABLE "investigations" CONSTRAINT "investigations_task_id_fkey" FOREIGN KEY (task_id) REFERENCES agent_tasks(id) ON DELETE CASCADE
+    TABLE "object_refs" CONSTRAINT "object_refs_task_id_fkey" FOREIGN KEY (task_id) REFERENCES agent_tasks(id)
+    TABLE "pii_detections" CONSTRAINT "pii_detections_task_id_fkey" FOREIGN KEY (task_id) REFERENCES agent_tasks(id)
+    TABLE "shadow_recommendations" CONSTRAINT "shadow_recommendations_task_id_fkey" FOREIGN KEY (task_id) REFERENCES agent_tasks(id)
+    TABLE "siem_alerts" CONSTRAINT "siem_alerts_task_id_fkey" FOREIGN KEY (task_id) REFERENCES agent_tasks(id)
+    TABLE "token_usage_events" CONSTRAINT "token_usage_events_task_id_fkey" FOREIGN KEY (task_id) REFERENCES agent_tasks(id)
+    TABLE "usage_records" CONSTRAINT "usage_records_task_id_fkey" FOREIGN KEY (task_id) REFERENCES agent_tasks(id) ON DELETE SET NULL
+    TABLE "working_memory_snapshots" CONSTRAINT "working_memory_snapshots_task_id_fkey" FOREIGN KEY (task_id) REFERENCES agent_tasks(id) ON DELETE CASCADE
+Policies (forced row security enabled):
+    POLICY "tenant_isolation"
+      USING ((tenant_id = current_tenant_id()))
+      WITH CHECK ((tenant_id = current_tenant_id()))
+
+
+=== to_regclass(llm_audit_log) ===
+

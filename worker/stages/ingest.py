@@ -36,31 +36,64 @@ from stages.input_sanitizer import sanitize_siem_event
 from stages.smart_batcher import get_batcher
 
 # --- Config ---
-try:
-    from settings import settings as _settings
-    DATABASE_URL = os.environ.get("DATABASE_URL", _settings.database_url)
-    REDIS_URL = os.environ.get("REDIS_URL", _settings.redis_url)
-except ImportError:
-    DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://zovark:hydra_dev_2026@pgbouncer:5432/zovark")
-    REDIS_URL = os.environ.get("REDIS_URL", "redis://:hydra-redis-dev-2026@redis:6379/0")
+# stabilize-runtime-hygiene: centralized DB/Redis URL via settings; no fallback literals.
+from settings import settings as _settings
+DATABASE_URL = os.environ.get("DATABASE_URL", _settings.database_url)
+REDIS_URL = os.environ.get("REDIS_URL", _settings.redis_url)
 FAST_FILL = os.environ.get("ZOVARK_FAST_FILL", "false").lower() == "true"
 
 
 # --- DB helper — uses ThreadedConnectionPool via pool_manager ---
-# FIX #3: replaced direct psycopg2.connect() with pooled_connection
+# Audit 2.1: use a context manager so connections are ALWAYS returned to the
+# ThreadedConnectionPool on both success and exception paths. The previous
+# pattern (`_get_db()` + `conn.close()` in a bare `finally`) leaked connections
+# whenever a caller forgot the `finally`, and the fallback direct-connect path
+# never returned anything to the pool at all.
+from contextlib import contextmanager
+
 try:
     from database.pool_manager import pooled_connection as _pooled_connection
     _USE_POOL = True
 except ImportError:
     _USE_POOL = False
 
-def _get_db():
-    """Return a DB connection. Uses pool when available, falls back to direct connect."""
+
+@contextmanager
+def _db_conn():
+    """Yield a DB connection; return it to the pool (or close it) on exit."""
     if _USE_POOL:
-        # Return a raw connection from the pool (caller must close to return it)
         from database.pool_manager import _pools
         pool = _pools.get("normal") or _pools.get("critical")
-        if pool:
+        if pool is not None:
+            conn = pool.getconn()
+            try:
+                yield conn
+            finally:
+                try:
+                    pool.putconn(conn)
+                except Exception:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+            return
+    # Fallback: direct connect — no pool to return to.
+    conn = psycopg2.connect(DATABASE_URL)
+    try:
+        yield conn
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _get_db():
+    """Legacy shim. Prefer `with _db_conn() as conn:` in new code."""
+    if _USE_POOL:
+        from database.pool_manager import _pools
+        pool = _pools.get("normal") or _pools.get("critical")
+        if pool is not None:
             return pool.getconn()
     return psycopg2.connect(DATABASE_URL)
 
@@ -216,21 +249,62 @@ def _mask_pii(text: str) -> tuple:
     return masked, count > 0
 
 
+# Audit 2.2: validate tenant_id before interpolating into SET LOCAL. uuid.UUID
+# raises ValueError on malformed input so we never construct SQL from untrusted
+# data. Import locally so a test that stubs out uuid doesn't break the module.
+import uuid as _uuid
+
+
+def validate_tenant_id(tenant_id: str) -> str:
+    """Validate tenant_id is a well-formed UUID. Returns the input on success,
+    raises ValueError otherwise. Every SET LOCAL app.current_tenant call MUST
+    go through this helper — otherwise a bug that lets user input reach
+    tenant_id becomes SQL injection on every transaction."""
+    if not isinstance(tenant_id, str) or not tenant_id:
+        raise ValueError("tenant_id must be a non-empty string")
+    _uuid.UUID(tenant_id)  # raises on invalid
+    return tenant_id
+
+
+def _set_tenant(cur, tenant_id: str) -> None:
+    """Apply SET LOCAL app.current_tenant inside the current transaction.
+    Audit 2.2: validated UUID path only."""
+    validated = validate_tenant_id(tenant_id)
+    # psycopg2.sql parameter binding doesn't work for SET LOCAL through
+    # PgBouncer transaction pooling, so we interpolate — but only after
+    # validate_tenant_id has guaranteed the string contains only [0-9a-f-].
+    cur.execute(f"SET LOCAL app.current_tenant = '{validated}'")
+
+
 # --- Skill retrieval (DB only, no LLM) ---
-def _retrieve_skill(task_type: str, prompt: str, conn) -> Optional[dict]:
-    """Find matching skill template. Pure DB query."""
+def _retrieve_skill(task_type: str, prompt: str, conn, tenant_id: str = "") -> Optional[dict]:
+    """Find matching skill template. Pure DB query.
+
+    Audit 2.4: when tenant_id is provided, the UPDATE runs inside a
+    transaction scoped by SET LOCAL app.current_tenant so RLS sees the
+    correct tenant. The SELECTs also filter by tenant_id as defence in depth.
+    """
     tt = task_type.lower().replace(" ", "_")
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # Priority 1: exact threat_type match
+            # Scope the transaction to the tenant if we have one.
+            if tenant_id:
+                try:
+                    _set_tenant(cur, tenant_id)
+                except ValueError as ve:
+                    print(f"_retrieve_skill: invalid tenant_id ({ve}) — aborting")
+                    return None
+
+            # Priority 1: exact threat_type match (tenant-scoped)
             cur.execute("""
                 SELECT id, skill_name, skill_slug, investigation_methodology,
                        detection_patterns, mitre_techniques, code_template, parameters
                 FROM agent_skills
                 WHERE is_active = true AND code_template IS NOT NULL
-                AND %s = ANY(threat_types)
+                  AND (%s = '' OR tenant_id::text = %s)
+                  AND %s = ANY(threat_types)
                 ORDER BY times_used DESC LIMIT 1
-            """, (tt,))
+            """, (tenant_id, tenant_id, tt))
             row = cur.fetchone()
 
             # Priority 2: prefix match
@@ -240,13 +314,19 @@ def _retrieve_skill(task_type: str, prompt: str, conn) -> Optional[dict]:
                            detection_patterns, mitre_techniques, code_template, parameters
                     FROM agent_skills
                     WHERE is_active = true AND code_template IS NOT NULL
-                    AND EXISTS (SELECT 1 FROM unnest(threat_types) t WHERE t LIKE %s || '%%' OR %s LIKE t || '%%')
+                      AND (%s = '' OR tenant_id::text = %s)
+                      AND EXISTS (SELECT 1 FROM unnest(threat_types) t WHERE t LIKE %s || '%%' OR %s LIKE t || '%%')
                     ORDER BY times_used DESC LIMIT 1
-                """, (tt, tt))
+                """, (tenant_id, tenant_id, tt, tt))
                 row = cur.fetchone()
 
             if row:
-                cur.execute("UPDATE agent_skills SET times_used = times_used + 1 WHERE id = %s", (row['id'],))
+                # Audit 2.4: SET LOCAL is active for this transaction so the
+                # UPDATE runs under the correct tenant RLS context.
+                cur.execute(
+                    "UPDATE agent_skills SET times_used = times_used + 1 WHERE id = %s",
+                    (row['id'],),
+                )
                 conn.commit()
                 return dict(row)
     except Exception as e:
@@ -257,8 +337,7 @@ def _retrieve_skill(task_type: str, prompt: str, conn) -> Optional[dict]:
 # --- Fetch task from DB (not @activity.defn — legacy fetch_task is registered) ---
 async def fetch_task(task_id: str) -> dict:
     """Load task from agent_tasks table. Shared by V2 workflow."""
-    conn = _get_db()
-    try:
+    with _db_conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
                 "SELECT id, tenant_id, task_type, input, status, trace_id, raw_input, dedup_hash FROM agent_tasks WHERE id = %s",
@@ -271,8 +350,6 @@ async def fetch_task(task_id: str) -> dict:
             row['tenant_id'] = str(row['tenant_id'])
             row['trace_id'] = str(row['trace_id']) if row.get('trace_id') else ""
             return dict(row)
-    finally:
-        conn.close()
 
 
 # --- Main entry point ---
@@ -328,7 +405,10 @@ async def __ingest_alert_core(task_data: dict) -> dict:
         try:
             batcher = get_batcher(_redis_client)
             severity = task_data.get("input", {}).get("severity", "medium")
-            should_skip, aggregated = batcher.should_batch(task_type, siem_event, severity)
+            # Audit 2.12: tenant_id is now mandatory on every batch key.
+            should_skip, aggregated = batcher.should_batch(
+                tenant_id, task_type, siem_event, severity
+            )
 
             if should_skip:
                 activity.logger.info(f"Smart batcher: alert absorbed into batch for {task_type}")
@@ -370,9 +450,8 @@ async def __ingest_alert_core(task_data: dict) -> dict:
 
     # --- Skill retrieval ---
     try:
-        conn = _get_db()
-        try:
-            skill = _retrieve_skill(task_type, prompt, conn)
+        with _db_conn() as conn:
+            skill = _retrieve_skill(task_type, prompt, conn, tenant_id)
             if skill:
                 # Red team patch: content-based override
                 # If skill routes to benign but raw_log has attack content, block benign routing
@@ -391,8 +470,6 @@ async def __ingest_alert_core(task_data: dict) -> dict:
                     result.skill_template = skill.get("code_template")
                     result.skill_params = skill.get("parameters", [])
                     result.skill_methodology = skill.get("investigation_methodology", "")
-        finally:
-            conn.close()
     except Exception as e:
         print(f"Skill retrieval failed (non-fatal): {e}")
 

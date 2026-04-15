@@ -255,7 +255,13 @@ func checkPreDedup(ctx context.Context, taskType string, input map[string]interf
 			slog.String("dedup.old_status", entry.Status),
 			slog.String("outcome", "retry"),
 		)
-		redisClient.Del(ctx, key)
+		// Delete the stale entry; if Del fails the retry path may keep bouncing — log and escalate.
+		if delErr := redisClient.Del(ctx, key).Err(); delErr != nil {
+			slog.ErrorContext(ctx, "dedup_del_failed",
+				slog.String("dedup.hash_prefix", hash[:16]),
+				slog.String("err", delErr.Error()),
+			)
+		}
 		recordDedupDecision(ctx, "retry_after_failure")
 		return false, ""
 	}

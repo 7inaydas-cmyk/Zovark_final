@@ -27,6 +27,7 @@ import json
 import logging
 import os
 import re
+import sys
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 import shutil
 import subprocess
@@ -1577,6 +1578,62 @@ def start_api_server():
 
 # ── Main Loop ─────────────────────────────────────────────────────────
 
+def probe_socket_proxy_reachability():
+    """telemetry-audit-fix D5: startup readiness probe for docker-socket-proxy.
+
+    Bound-after-HTTP-server-started: the API thread is already running by the
+    time this runs, so :8081/api/health is reachable regardless of the probe
+    outcome. Purpose is purely diagnostic — operators reading `docker compose
+    logs healer` get a clear single-line success/failure signal instead of
+    chasing a silent hang.
+
+    Retries with exponential backoff (2 → 4 → 8 → 16 seconds, max 10 attempts,
+    ~30s total budget). On persistent failure, sys.exit(1) so the compose
+    `restart: unless-stopped` policy recycles the container.
+    """
+    docker_host = os.environ.get("DOCKER_HOST", "")
+    if not docker_host:
+        log.info("[healer] DOCKER_HOST unset; skipping socket-proxy probe")
+        return
+
+    # Expected shape: tcp://docker-socket-proxy:2375
+    import urllib.request
+    import urllib.error
+    if docker_host.startswith("tcp://"):
+        host_port = docker_host[len("tcp://"):]
+    else:
+        log.info("[healer] DOCKER_HOST=%s is not tcp://, skipping probe", docker_host)
+        return
+
+    probe_url = f"http://{host_port}/_ping"
+    delays = [2, 4, 8, 16, 2, 4, 8, 16, 2, 4]  # 10 attempts, ~66s worst case
+    for attempt, delay in enumerate(delays, 1):
+        try:
+            with urllib.request.urlopen(probe_url, timeout=5) as resp:
+                body = resp.read(16).decode("utf-8", errors="replace").strip()
+                if resp.status == 200 and body.lower() == "ok":
+                    log.info("[healer] docker socket proxy reachable at %s (attempt %d)",
+                             docker_host, attempt)
+                    return
+                log.warning("[healer] docker socket proxy probe: HTTP %d body=%r",
+                            resp.status, body)
+        except urllib.error.HTTPError as e:
+            log.warning("[healer] docker socket proxy HTTP error (attempt %d/%d): %s",
+                        attempt, len(delays), e)
+        except urllib.error.URLError as e:
+            log.warning("[healer] docker socket proxy unreachable (attempt %d/%d): %s",
+                        attempt, len(delays), e.reason)
+        except Exception as e:  # pragma: no cover
+            log.warning("[healer] docker socket proxy probe error (attempt %d/%d): %s",
+                        attempt, len(delays), e)
+        if attempt < len(delays):
+            time.sleep(delay)
+
+    log.error("[healer] docker socket proxy never became reachable — exiting so "
+              "compose restart policy recycles the container")
+    sys.exit(1)
+
+
 def main():
     """Entry point — service discovery, health checks, auto-heal."""
     log.info("=" * 60)
@@ -1590,10 +1647,17 @@ def main():
     # Ensure log directory exists
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Start API server in background — must bind before health checks start
+    # Start API server in background — must bind before health checks start.
+    # telemetry-audit-fix D5: the HTTP server binds FIRST so /api/health is
+    # reachable even while the socket-proxy probe below is retrying.
     api_thread = threading.Thread(target=start_api_server, daemon=True)
     api_thread.start()
     time.sleep(2)  # Let API thread bind port before health checks block
+
+    # telemetry-audit-fix D5: diagnostic probe of the docker-socket-proxy
+    # handshake. Logs a clear success/failure line so operators reading
+    # `docker compose logs healer` don't chase a silent hang.
+    probe_socket_proxy_reachability()
 
     emit_event("INFO", "healer", "Fleet Agent started",
                f"interval={CHECK_INTERVAL}s, llm={LLM_MODEL}")

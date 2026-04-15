@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -12,6 +14,34 @@ import (
 	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
 )
+
+// bcryptCost returns the configured bcrypt cost with a minimum of 12.
+// Audit 1.14: DefaultCost is 10, which is below modern guidance.
+// Override via ZOVARK_BCRYPT_COST (clamped to [12, 15]).
+func bcryptCost() int {
+	const minCost = 12
+	const maxCost = 15
+	if v := strings.TrimSpace(os.Getenv("ZOVARK_BCRYPT_COST")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			if n < minCost {
+				n = minCost
+			}
+			if n > maxCost {
+				n = maxCost
+			}
+			return n
+		}
+	}
+	return minCost
+}
+
+// dummyBcryptHash is a valid bcrypt hash of a random string. It's used to run
+// a constant-time bcrypt compare when an email lookup misses, eliminating the
+// email-enumeration timing oracle (audit 1.14).
+//
+// Generated with: bcrypt.GenerateFromPassword([]byte("zovark-dummy-never-match"), 12)
+// Matches no real password — deliberately chosen.
+const dummyBcryptHash = "$2a$12$ZPFCbvNLwrK1.xhEYjXVTeb8LFMzu.fQj/Ff.tJnDXm3DZ0/MJdUi"
 
 type RegisterRequest struct {
 	Email       string `json:"email" binding:"required,email"`
@@ -73,7 +103,8 @@ func registerHandler(c *gin.Context) {
 		return
 	}
 
-	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+	// Audit 1.14: bcrypt cost 12 is the modern minimum. DefaultCost is 10.
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcryptCost())
 	if err != nil {
 		respondInternalError(c, err, "hash password")
 		return
@@ -130,7 +161,13 @@ func loginHandler(c *gin.Context) {
 		"SELECT id, tenant_id, email, role, password_hash FROM users WHERE email = $1", req.Email).
 		Scan(&user.ID, &user.TenantID, &user.Email, &user.Role, &user.PasswordHash)
 
+	// Audit 1.14: eliminate the email-enumeration timing oracle by running a
+	// dummy bcrypt compare when the user row is missing. Without this, an
+	// attacker measuring login latency can distinguish "user exists, wrong
+	// password" (slow — bcrypt ran) from "user does not exist" (fast — miss)
+	// and enumerate valid emails.
 	if err != nil {
+		_ = bcrypt.CompareHashAndPassword([]byte(dummyBcryptHash), []byte(req.Password))
 		slog.WarnContext(c.Request.Context(), "auth_login_failed",
 			slog.String("event", "auth.login"),
 			slog.String("outcome", "failure"),
@@ -141,7 +178,7 @@ func loginHandler(c *gin.Context) {
 	}
 
 	// Check account lockout
-	if checkAccountLocked(req.Email) {
+	if checkAccountLocked(c.Request.Context(), req.Email) {
 		slog.WarnContext(c.Request.Context(), "auth_login_failed",
 			slog.String("event", "auth.login"),
 			slog.String("outcome", "failure"),
@@ -153,7 +190,7 @@ func loginHandler(c *gin.Context) {
 	}
 
 	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(req.Password)); err != nil {
-		recordFailedLogin(req.Email)
+		recordFailedLogin(c.Request.Context(), req.Email)
 		slog.WarnContext(c.Request.Context(), "auth_login_failed",
 			slog.String("event", "auth.login"),
 			slog.String("outcome", "failure"),
@@ -165,7 +202,7 @@ func loginHandler(c *gin.Context) {
 	}
 
 	// Check TOTP 2FA if enabled
-	totpValid, totpErr := checkTOTP(user.ID, req.TOTPCode)
+	totpValid, totpErr := checkTOTP(c.Request.Context(), user.ID, req.TOTPCode)
 	if totpErr != nil {
 		respondInternalError(c, totpErr, "verify 2FA")
 		return
@@ -188,7 +225,7 @@ func loginHandler(c *gin.Context) {
 		return
 	}
 
-	recordSuccessfulLogin(req.Email)
+	recordSuccessfulLogin(c.Request.Context(), req.Email)
 
 	// Access token: 30 minutes
 	accessClaims := CustomClaims{

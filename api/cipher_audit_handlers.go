@@ -83,8 +83,11 @@ func cipherAuditSummaryHandler(c *gin.Context) {
 		ORDER BY audit_date DESC, server_hostname ASC
 		LIMIT 200`, tid)
 	if err != nil {
-		// Materialized view may not exist yet
-		c.JSON(http.StatusOK, gin.H{"servers": []interface{}{}, "count": 0})
+		if isRelationMissing(err) {
+			c.JSON(http.StatusOK, gin.H{"servers": []interface{}{}, "count": 0})
+			return
+		}
+		respondInternalError(c, err, "query cipher audit summary")
 		return
 	}
 	defer rows.Close()
@@ -172,8 +175,11 @@ func cipherAuditFindingsHandler(c *gin.Context) {
 
 	rows, err := dbPool.Query(ctx, query, args...)
 	if err != nil {
-		// Table may not exist — return empty gracefully
-		c.JSON(http.StatusOK, gin.H{"findings": []interface{}{}, "count": 0, "limit": limit, "offset": offset})
+		if isRelationMissing(err) {
+			c.JSON(http.StatusOK, gin.H{"findings": []interface{}{}, "count": 0, "limit": limit, "offset": offset})
+			return
+		}
+		respondInternalError(c, err, "query cipher audit findings")
 		return
 	}
 	defer rows.Close()

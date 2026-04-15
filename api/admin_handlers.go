@@ -26,6 +26,22 @@ var secretPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`\b\d{3}-\d{2}-\d{4}\b`),
 	regexp.MustCompile(`(?i)(sk|pk|api[_-]?key|token|secret|bearer)[_-]?\w{20,}`),
 	regexp.MustCompile(`(?i)(hydra[_-]dev[_-]2026|hydra-redis-dev-2026|zovark[_-]dev[_-]2026|zovark-redis-dev-2026)`),
+	// JWTs (eyJ...eyJ...base64url)
+	regexp.MustCompile(`eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}`),
+	// GCP service account JSON private keys
+	regexp.MustCompile(`"private_key"\s*:\s*"[^"]+"`),
+	regexp.MustCompile(`-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP |ENCRYPTED )?PRIVATE KEY-----[\s\S]+?-----END (?:RSA |EC |OPENSSH |DSA |PGP |ENCRYPTED )?PRIVATE KEY-----`),
+	// Azure SAS tokens
+	regexp.MustCompile(`(?i)\bsig=[A-Za-z0-9%]{20,}`),
+	// Slack webhooks
+	regexp.MustCompile(`https://hooks\.slack\.com/services/[A-Z0-9/]+`),
+	// Stripe live/test keys
+	regexp.MustCompile(`sk_(?:live|test)_[0-9a-zA-Z]{24,}`),
+	regexp.MustCompile(`rk_(?:live|test)_[0-9a-zA-Z]{24,}`),
+	// GitHub tokens
+	regexp.MustCompile(`gh[pousr]_[0-9a-zA-Z]{20,}`),
+	// Google API keys
+	regexp.MustCompile(`AIza[0-9A-Za-z_-]{35}`),
 }
 
 func scrubSecrets(input string) string {
@@ -173,6 +189,47 @@ func addJSONToZip(zw *zip.Writer, filename string, data interface{}) {
 		return
 	}
 	w.Write([]byte(scrubbed))
+}
+
+// probeDBHandler exercises the parameterised INSERT...RETURNING + DELETE round-trip
+// that catches pgx<->PgBouncer prepared-statement collisions (SQLSTATE 08P01).
+// Unlike GET /ready (which sends a parameterless SELECT 1 that pgx fast-paths
+// regardless of mode), this handler hits the same code path that POST /api/v1/tasks
+// uses to write to agent_tasks. If it returns 500 with 08P01 in the API log,
+// the API is misconfigured against PgBouncer and the e2e probe Stage 0.5 will
+// flag it as a DB-write failure rather than letting it surface as an "ingest stall".
+//
+// POST /api/v1/admin/diagnostics/probe-db
+func probeDBHandler(c *gin.Context) {
+	ctx := c.Request.Context()
+	start := time.Now()
+
+	tx, err := dbPool.Begin(ctx)
+	if err != nil {
+		respondInternalError(c, err, "probe-db")
+		return
+	}
+	defer tx.Rollback(ctx)
+
+	var rowID string
+	if err := tx.QueryRow(ctx, "INSERT INTO probe_writes DEFAULT VALUES RETURNING id").Scan(&rowID); err != nil {
+		respondInternalError(c, err, "probe-db")
+		return
+	}
+	if _, err := tx.Exec(ctx, "DELETE FROM probe_writes WHERE id = $1", rowID); err != nil {
+		respondInternalError(c, err, "probe-db")
+		return
+	}
+	if err := tx.Commit(ctx); err != nil {
+		respondInternalError(c, err, "probe-db")
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"ok":      true,
+		"took_ms": time.Since(start).Milliseconds(),
+		"row_id":  rowID,
+	})
 }
 
 func fetchHealerData(url string) interface{} {

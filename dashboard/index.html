@@ -7,8 +7,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta name="description" content="Zovark - Autonomous AI Security Platform" />
   <title>Zovark | AI-Powered Security</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <!-- Audit 4.7: removed Google Fonts preconnect + stylesheet. Zovark is an
+       air-gap-capable SOC product; reaching out to fonts.googleapis.com breaks
+       that promise and leaks ambient telemetry. Fonts are self-hosted by
+       Tailwind's @font-face in src/index.css (JetBrains Mono fallback chain). -->
 </head>
 
 <body style="background:#060A14">

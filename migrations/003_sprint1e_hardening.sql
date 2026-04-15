@@ -6,11 +6,11 @@
 -- Re-hash password with SCRAM (requires postgresql.conf change first)
 -- ============================================================
 
-ALTER SYSTEM SET password_encryption = 'scram-sha-256';
-SELECT pg_reload_conf();
-
--- Re-set password to generate SCRAM hash (password from .env / docker-compose default)
-ALTER USER hydra PASSWORD 'hydra_dev_2026';
+-- NOTE: ALTER SYSTEM cannot run inside a transaction block (migration runner uses implicit tx).
+-- PG16 defaults to scram-sha-256 already. Skipping. Also, user is 'zovark' not 'hydra'.
+-- ALTER SYSTEM SET password_encryption = 'scram-sha-256';
+-- SELECT pg_reload_conf();
+-- ALTER USER hydra PASSWORD 'hydra_dev_2026';
 
 -- ============================================================
 -- 1E-4: Structured Audit Events Table (partitioned)

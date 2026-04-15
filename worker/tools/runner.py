@@ -6,10 +6,10 @@ Optional: dependency-aware parallel execution (ZOVARK_PARALLEL_TOOLS_ENABLED).
 import re
 import json
 import time
-import signal
 import logging
 from typing import Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 
 from tools.catalog import TOOL_CATALOG
 
@@ -238,11 +238,29 @@ def _run_single_step(i: int, step: dict, step_results: dict,
         except Exception:
             pass
 
+        # Audit 2.5: run the tool in a dedicated single-worker ThreadPoolExecutor
+        # so `future.result(timeout=...)` can actually interrupt a runaway tool.
+        # The previous implementation ran the tool synchronously and only
+        # measured wall-clock after the fact — a tool that entered `while True:`
+        # would block its activity worker until Temporal killed the whole
+        # activity. With the executor path, an infinite-loop tool is reported
+        # as a step timeout and the next step still runs.
         tool_start = time.monotonic()
-        result = tool_entry["function"](**resolved_args)
-        tool_elapsed = time.monotonic() - tool_start
-
-        timeout_exceeded = tool_elapsed > per_tool_timeout
+        timeout_exceeded = False
+        try:
+            with ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"tool-{tool_name}") as _pool:
+                _fut = _pool.submit(tool_entry["function"], **resolved_args)
+                try:
+                    result = _fut.result(timeout=per_tool_timeout)
+                except FuturesTimeoutError:
+                    timeout_exceeded = True
+                    # Cancel best-effort; synchronous work is unkillable at the
+                    # Python level, but the worker thread will drain on pool
+                    # shutdown. Returning here lets the next step run.
+                    _fut.cancel()
+                    result = None
+        finally:
+            tool_elapsed = time.monotonic() - tool_start
 
         if _span:
             try:

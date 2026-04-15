@@ -1,6 +1,11 @@
 # ============================================================
 # Zovark Air-Gap Deployment Compose Override
 # Usage: docker compose -f docker-compose.airgap.yml up -d
+#
+# OPERATOR NOTE (stabilize-runtime-hygiene, 2026-04-15):
+#   All credential env vars are REQUIRED. This file no longer ships with
+#   hardcoded passwords. Populate `.env` from `.env.example` before boot.
+#   Compose v2 will exit non-zero and name any missing variable.
 # ============================================================
 
 services:
@@ -11,7 +16,7 @@ services:
     container_name: zovark-postgres
     environment:
       POSTGRES_USER: zovark
-      POSTGRES_PASSWORD: hydra_dev_2026
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required — see .env.example}
       POSTGRES_DB: zovark
     volumes:
       - postgres_data:/var/lib/postgresql/data
@@ -31,7 +36,7 @@ services:
   redis:
     image: valkey/valkey:7-alpine
     container_name: zovark-redis
-    command: valkey-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    command: valkey-server --maxmemory 256mb --maxmemory-policy allkeys-lru --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD is required — see .env.example}
     volumes:
       - redis_data:/data
     restart: unless-stopped
@@ -46,7 +51,7 @@ services:
       - DB=postgres12
       - DB_PORT=5432
       - POSTGRES_USER=zovark
-      - POSTGRES_PWD=hydra_dev_2026
+      - POSTGRES_PWD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required — see .env.example}
       - POSTGRES_SEEDS=postgres
       - DYNAMIC_CONFIG_FILE_PATH=config/dynamicconfig/development-sql.yaml
     depends_on:
@@ -94,9 +99,9 @@ services:
     container_name: zovark-litellm
     command: --config /app/config.yaml --port 4000
     environment:
-      - LITELLM_MASTER_KEY=sk-zovark-local
-      - DATABASE_URL=postgresql://zovark:hydra_dev_2026@postgres:5432/zovark
-      - OPENROUTER_API_KEY=not-needed
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:?LITELLM_MASTER_KEY is required — see .env.example}
+      - DATABASE_URL=postgresql://zovark:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required — see .env.example}@postgres:5432/zovark
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-not-needed}
     volumes:
       - ./litellm_config.yaml:/app/config.yaml:ro
     depends_on:
@@ -120,10 +125,10 @@ services:
       - "8090:8090"
     environment:
       - PORT=8090
-      - DATABASE_URL=postgresql://zovark:hydra_dev_2026@postgres:5432/zovark
+      - DATABASE_URL=postgresql://zovark:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required — see .env.example}@postgres:5432/zovark
       - TEMPORAL_ADDRESS=temporal:7233
-      - LITELLM_MASTER_KEY=sk-zovark-local
-      - JWT_SECRET=${JWT_SECRET:-change-me-in-production}
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:?LITELLM_MASTER_KEY is required — see .env.example}
+      - JWT_SECRET=${JWT_SECRET:?JWT_SECRET is required — generate via openssl rand base64 64}
       - ZOVARK_DEPLOYMENT_MODE=airgap
     depends_on:
       postgres:
@@ -139,11 +144,11 @@ services:
     image: zovark-mvp-worker:latest
     # No container_name — allows docker compose --scale worker=N
     environment:
-      - DATABASE_URL=postgresql://zovark:hydra_dev_2026@postgres:5432/zovark
+      - DATABASE_URL=postgresql://zovark:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required — see .env.example}@postgres:5432/zovark
       - TEMPORAL_ADDRESS=temporal:7233
-      - ZOVARK_LLM_ENDPOINT=http://litellm:4000/v1/chat/completions
-      - ZOVARK_LLM_KEY=sk-zovark-local
-      - ZOVARK_LLM_MODEL=zovark-local
+      - ZOVARK_LLM_ENDPOINT=${ZOVARK_LLM_ENDPOINT:-http://litellm:4000/v1/chat/completions}
+      - ZOVARK_LLM_KEY=${ZOVARK_LLM_KEY:?ZOVARK_LLM_KEY is required — see .env.example}
+      - ZOVARK_LLM_MODEL=${ZOVARK_LLM_MODEL:-zovark-local}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     depends_on:

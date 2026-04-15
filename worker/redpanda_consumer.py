@@ -35,6 +35,9 @@ class RedpandaTaskConsumer:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._consumer: Optional[KafkaConsumer] = None
+        # fix-e2e-ingest-stall D3: track previously-assigned partitions so we
+        # can log only when the assignment actually changes (not every poll).
+        self._last_assignment: frozenset = frozenset()
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run, daemon=True, name="redpanda-task-consumer")
@@ -58,6 +61,16 @@ class RedpandaTaskConsumer:
         if not hosts:
             logger.warn("ZOVARK_REDPANDA_BROKERS not set — Redpanda task consumer idle")
             return
+        # fix-e2e-ingest-stall D1: lower metadata refresh interval from the
+        # kafka-python default of 300_000 ms. Pattern subscription only
+        # discovers new tenant topics during a metadata refresh; with the
+        # default, a freshly-created tasks.new.<tenant> topic could take up
+        # to 5 minutes to be picked up — well past the e2e probe's 90s
+        # Stage 3 budget. 10 seconds gives 9× headroom on the probe and
+        # negligible broker chatter (one MetadataRequest per worker per 10s).
+        metadata_max_age_ms = int(
+            os.environ.get("ZOVARK_REDPANDA_METADATA_MAX_AGE_MS", "10000")
+        )
         try:
             self._consumer = KafkaConsumer(
                 bootstrap_servers=hosts,
@@ -67,8 +80,22 @@ class RedpandaTaskConsumer:
                 auto_offset_reset="earliest",
                 enable_auto_commit=True,
                 consumer_timeout_ms=1500,
+                metadata_max_age_ms=metadata_max_age_ms,
             )
             self._consumer.subscribe(pattern=r"^tasks\.new\..+$")
+            # fix-e2e-ingest-stall D2: force an immediate metadata fetch so
+            # any pre-existing tasks.new.* topics are discovered within the
+            # first millisecond of startup, not after one full
+            # metadata_max_age_ms interval.
+            try:
+                self._consumer.poll(timeout_ms=0)
+            except Exception:
+                pass  # non-blocking; broker may not be up yet, the loop will retry
+            logger.info(
+                "Redpanda consumer subscribed",
+                pattern="^tasks.new..+$",
+                metadata_max_age_ms=metadata_max_age_ms,
+            )
         except KafkaError as e:
             logger.error("Redpanda consumer init failed", error=str(e))
             return
@@ -76,6 +103,27 @@ class RedpandaTaskConsumer:
         while not self._stop.is_set():
             try:
                 batches = self._consumer.poll(timeout_ms=1000)
+                # fix-e2e-ingest-stall D3: log assignment changes once per
+                # change (not every poll). Converts silent waiting into an
+                # observable signal for "consumer subscribed but no topics
+                # match yet" vs "consumer is processing".
+                try:
+                    current = frozenset(
+                        f"{tp.topic}:{tp.partition}"
+                        for tp in self._consumer.assignment()
+                    )
+                except Exception:
+                    current = frozenset()
+                if current != self._last_assignment:
+                    topics = sorted({entry.split(":", 1)[0] for entry in current})
+                    logger.info(
+                        "Redpanda consumer assignment changed",
+                        partitions=len(current),
+                        topic_count=len(topics),
+                        topics=",".join(topics) if topics else "(none)",
+                    )
+                    self._last_assignment = current
+
                 for _tp, records in batches.items():
                     for record in records:
                         if self._stop.is_set():

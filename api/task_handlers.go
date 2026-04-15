@@ -234,7 +234,10 @@ func createTaskHandler(c *gin.Context) {
 	allowed, depth := checkBackpressure(c.Request.Context())
 	if !allowed {
 		if isHardLimitReached(depth) {
-			_, _ = dbPool.Exec(c.Request.Context(), "UPDATE agent_tasks SET status = 'failed' WHERE id = $1", taskID)
+			// Detached context — request context may already be cancelled on hard limit.
+			cleanCtx, cleanCancel := detachedCleanupCtx()
+			_, _ = dbPool.Exec(cleanCtx, "UPDATE agent_tasks SET status = 'failed' WHERE id = $1", taskID)
+			cleanCancel()
 			c.JSON(http.StatusServiceUnavailable, gin.H{
 				"error":       "system at capacity, please retry",
 				"retry_after": 30,
@@ -243,7 +246,9 @@ func createTaskHandler(c *gin.Context) {
 			return
 		}
 		// Soft limit — queue for drain goroutine
-		_, _ = dbPool.Exec(c.Request.Context(), "UPDATE agent_tasks SET status = 'queued' WHERE id = $1", taskID)
+		cleanCtx2, cleanCancel2 := detachedCleanupCtx()
+		_, _ = dbPool.Exec(cleanCtx2, "UPDATE agent_tasks SET status = 'queued' WHERE id = $1", taskID)
+		cleanCancel2()
 		c.JSON(http.StatusAccepted, gin.H{
 			"task_id":  taskID,
 			"status":   "queued",
@@ -256,7 +261,9 @@ func createTaskHandler(c *gin.Context) {
 	pubCtx, pubCancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
 	defer pubCancel()
 	if err := publishTaskNew(pubCtx, tenantID, taskID, req.TaskType, req.Input); err != nil {
-		_, _ = dbPool.Exec(c.Request.Context(), "UPDATE agent_tasks SET status = 'failed' WHERE id = $1", taskID)
+		cleanCtx, cleanCancel := detachedCleanupCtx()
+		_, _ = dbPool.Exec(cleanCtx, "UPDATE agent_tasks SET status = 'failed' WHERE id = $1", taskID)
+		cleanCancel()
 		respondInternalError(c, err, "publish task")
 		return
 	}
@@ -701,7 +708,9 @@ func uploadTaskHandler(c *gin.Context) {
 	pubCtx, pubCancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
 	defer pubCancel()
 	if err := publishTaskNew(pubCtx, tenantID, taskID, taskType, inputMap); err != nil {
-		_, _ = dbPool.Exec(c.Request.Context(), "UPDATE agent_tasks SET status = 'failed' WHERE id = $1", taskID)
+		cleanCtx, cleanCancel := detachedCleanupCtx()
+		_, _ = dbPool.Exec(cleanCtx, "UPDATE agent_tasks SET status = 'failed' WHERE id = $1", taskID)
+		cleanCancel()
 		respondInternalError(c, err, "publish upload task")
 		return
 	}
@@ -729,8 +738,16 @@ func getTaskStepsHandler(c *gin.Context) {
 		return
 	}
 
+	// Defense in depth: even though existence was checked above, filter the detail
+	// query by tenant_id too. If investigation_steps ever lacks an RLS policy or the
+	// existence check has a bug, this prevents cross-tenant step exposure.
 	rows, err := dbPool.Query(c.Request.Context(),
-		"SELECT id, step_number, step_type, prompt, generated_code, output, status, tokens_used_input, tokens_used_output, execution_ms, created_at, completed_at, execution_mode, parameters_used FROM investigation_steps WHERE task_id = $1 ORDER BY step_number ASC", taskID)
+		`SELECT s.id, s.step_number, s.step_type, s.prompt, s.generated_code, s.output, s.status,
+		        s.tokens_used_input, s.tokens_used_output, s.execution_ms, s.created_at, s.completed_at,
+		        s.execution_mode, s.parameters_used
+		 FROM investigation_steps s JOIN agent_tasks t ON s.task_id = t.id
+		 WHERE s.task_id = $1 AND t.tenant_id = $2
+		 ORDER BY s.step_number ASC`, taskID, tenantID)
 	if err != nil {
 		respondInternalError(c, err, "query task steps")
 		return
@@ -819,11 +836,12 @@ func getTaskTimelineHandler(c *gin.Context) {
 		})
 	}
 
-	// 2. Fetch steps
+	// 2. Fetch steps (tenant-scoped via join — defense in depth against RLS bugs)
 	stepRows, err := dbPool.Query(c.Request.Context(), `
-		SELECT id, step_number, step_type, summary_prompt, status, execution_ms, created_at
-		FROM investigation_steps WHERE task_id = $1 ORDER BY created_at ASC
-	`, taskID)
+		SELECT s.id, s.step_number, s.step_type, s.summary_prompt, s.status, s.execution_ms, s.created_at
+		FROM investigation_steps s JOIN agent_tasks t ON s.task_id = t.id
+		WHERE s.task_id = $1 AND t.tenant_id = $2 ORDER BY s.created_at ASC
+	`, taskID, tenantID)
 	if err == nil {
 		defer stepRows.Close()
 		for stepRows.Next() {
@@ -1026,7 +1044,9 @@ func bulkCreateTasksHandler(c *gin.Context) {
 				slog.String("task_type", task.TaskType),
 				slog.Any("error", err),
 			)
-			_, _ = dbPool.Exec(ctx, "UPDATE agent_tasks SET status = 'failed' WHERE id = $1", taskID)
+			cleanCtx, cleanCancel := detachedCleanupCtx()
+			_, _ = dbPool.Exec(cleanCtx, "UPDATE agent_tasks SET status = 'failed' WHERE id = $1", taskID)
+			cleanCancel()
 			workflowIDs = append(workflowIDs, "")
 			continue
 		}

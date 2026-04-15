@@ -15,7 +15,9 @@ Usage:
 All tracing is optional — if OTEL_ENABLED=false or the collector is unreachable,
 the pipeline works identically. Tracing never blocks or fails investigations.
 """
+import atexit
 import os
+import threading
 from contextlib import contextmanager
 
 try:
@@ -33,6 +35,13 @@ trace_enabled = False
 tracer = None
 _otel_log_provider = None  # shutdown flush for SigNoz
 _otel_logging_initialized = False
+
+# Audit 2.29: guard lazy init against concurrent callers. Two pipeline stages
+# calling get_tracer() simultaneously could previously race and register two
+# TracerProviders. Also register the trace provider's shutdown() via atexit so
+# BatchSpanProcessor flushes pending spans on worker exit.
+_init_lock = threading.Lock()
+_trace_provider_for_shutdown = None
 
 
 class _NoOpSpan:
@@ -91,6 +100,22 @@ def init_tracing():
             schedule_delay_millis=5000,
         ))
         trace.set_tracer_provider(provider)
+
+        # Audit 2.29: register shutdown() at atexit so spans in the
+        # BatchSpanProcessor queue flush on graceful worker exit. Guard against
+        # double-registration when get_tracer() is called repeatedly.
+        global _trace_provider_for_shutdown
+        if _trace_provider_for_shutdown is None:
+            _trace_provider_for_shutdown = provider
+
+            def _shutdown_trace_provider():
+                try:
+                    if _trace_provider_for_shutdown is not None:
+                        _trace_provider_for_shutdown.shutdown()
+                except Exception:
+                    pass
+
+            atexit.register(_shutdown_trace_provider)
 
         try:
             from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
@@ -225,8 +250,10 @@ def init_otel_logging():
 
 
 def get_tracer():
-    """Get the global tracer (initializes on first call)."""
+    """Get the global tracer (initializes on first call, thread-safe)."""
     global tracer
     if tracer is None:
-        init_tracing()
+        with _init_lock:
+            if tracer is None:
+                init_tracing()
     return tracer

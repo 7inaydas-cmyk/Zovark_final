@@ -55,10 +55,14 @@ processors:
       - name: container.name
 
 extensions:
+  # Audit 3.17: pprof is loopback-only inside the collector container so
+  # sibling containers on the internal bridge can't scrape heap/goroutine
+  # dumps. health_check stays on all interfaces because docker-compose health
+  # probes it from outside the collector process.
   health_check:
     endpoint: 0.0.0.0:13133
   pprof:
-    endpoint: 0.0.0.0:1777
+    endpoint: 127.0.0.1:1777
 
 exporters:
   clickhousetraces:

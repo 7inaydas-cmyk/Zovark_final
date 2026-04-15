@@ -108,7 +108,17 @@ def test_smoke_emit_worker_otel_span_and_log():
         span.set_attribute("signoz.smoke.case", "worker_manual_span")
     log = logging.getLogger("zovark_worker")
     log.warning("signoz_smoke_log_line run_id=%s", rid)
-    time.sleep(0.5)
+    # Audit 5.14: force flush instead of sleeping. Sleeps are non-deterministic
+    # on slow CI runners and mask slow exporters under the guise of "success".
+    try:
+        provider = getattr(tracer, "_provider", None)
+        if provider is None:
+            from opentelemetry import trace as _trace
+            provider = _trace.get_tracer_provider()
+        if hasattr(provider, "force_flush"):
+            provider.force_flush(timeout_millis=5000)
+    except Exception:  # pragma: no cover - best-effort
+        pass
 
 
 def test_smoke_emit_httpx_client_span_when_otel_on():

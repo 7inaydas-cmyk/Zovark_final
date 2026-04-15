@@ -3,10 +3,39 @@ package main
 import (
 	"context"
 	"net/http"
+	"sync/atomic"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
+
+// feedbackRefreshPending is a monotonic counter bumped by each submitFeedback
+// call; a single background goroutine runs at most one REFRESH MATERIALIZED
+// VIEW every 30 seconds when any bump arrived in the interval. Replaces the
+// per-submit spawn that could flood the pool during feedback bursts.
+var feedbackRefreshPending int64
+
+// feedbackRefreshStarted is atomically CAS-flipped on first call to ensure the
+// debounce goroutine starts exactly once.
+var feedbackRefreshStarted int32
+
+func startFeedbackRefreshDebouncerOnce() {
+	if !atomic.CompareAndSwapInt32(&feedbackRefreshStarted, 0, 1) {
+		return
+	}
+	safeGoroutine("feedback_refresh_debouncer", func(_ context.Context) {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			if atomic.SwapInt64(&feedbackRefreshPending, 0) > 0 {
+				refreshCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+				_, _ = dbPool.Exec(refreshCtx, "REFRESH MATERIALIZED VIEW CONCURRENTLY feedback_accuracy")
+				cancel()
+			}
+		}
+	})
+}
 
 type FeedbackRequest struct {
 	VerdictCorrect    *bool    `json:"verdict_correct"`
@@ -59,10 +88,11 @@ func submitFeedbackHandler(c *gin.Context) {
 		return
 	}
 
-	// Refresh materialized view asynchronously (best effort)
-	go func() {
-		_, _ = dbPool.Exec(context.Background(), "REFRESH MATERIALIZED VIEW CONCURRENTLY feedback_accuracy")
-	}()
+	// Debounced refresh: flag dirty and let the 30-second ticker coalesce bursts.
+	// Previously spawned a goroutine per feedback which, under an adversarial
+	// burst, serialised REFRESH commands and starved the connection pool.
+	atomic.AddInt64(&feedbackRefreshPending, 1)
+	startFeedbackRefreshDebouncerOnce()
 
 	c.JSON(http.StatusCreated, gin.H{
 		"id":               feedbackID,

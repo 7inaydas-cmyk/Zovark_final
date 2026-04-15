@@ -78,7 +78,10 @@ postgresql:
   enabled: true
   auth:
     username: zovark
-    password: zovark_dev_2026
+    # REQUIRED — pass via `helm install --set postgresql.auth.password=<value>`
+    # or a secrets-management integration (Sealed Secrets, External Secrets Operator).
+    # Chart templates use `required` helper to fail render if empty.
+    password: ""
     database: zovark
   primary:
     persistence:
@@ -104,7 +107,8 @@ temporal:
 # ─── LiteLLM ─────────────────────────────────────────────
 litellm:
   enabled: true
-  masterKey: sk-zovark-dev-2026
+  # REQUIRED — pass via `helm install --set litellm.masterKey=<value>`
+  masterKey: ""
 
 # ─── Ingress ─────────────────────────────────────────────
 ingress:
@@ -130,11 +134,20 @@ ingress:
     #     - zovark.local
 
 # ─── Secrets ─────────────────────────────────────────────
+# ALL keys below are REQUIRED at install time. The chart templates wrap every
+# reference with Helm's `required` helper so `helm install` / `helm template`
+# fails with a readable error naming each missing value. Pass via:
+#   helm install zovark helm/zovarc/ \
+#     --set secrets.databaseUrl=postgresql://... \
+#     --set secrets.jwtSecret=$(openssl rand -base64 64) \
+#     --set secrets.litellmMasterKey=sk-... \
+#     --set secrets.redisUrl=redis://...
+# Or use a values override file not checked into git.
 secrets:
-  databaseUrl: "postgresql://zovark:zovark_dev_2026@postgresql:5432/zovark"
-  jwtSecret: "zovark-jwt-secret-dev-2026"
-  litellmMasterKey: "sk-zovark-dev-2026"
-  redisUrl: "redis://redis:6379/0"
+  databaseUrl: ""
+  jwtSecret: ""
+  litellmMasterKey: ""
+  redisUrl: ""
 
 # ─── Integration Secrets (optional) ──────────────────────
 integrations:

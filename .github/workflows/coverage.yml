@@ -6,6 +6,16 @@ on:
   pull_request:
     branches: [master, main]
 
+# stabilize-runtime-hygiene (2026-04-15):
+# test-only — ephemeral CI fixtures, not real secrets. This workflow boots its
+# own isolated postgres + redis services (not docker-compose.yml), so we only
+# need the few vars the coverage job directly consumes.
+env:
+  POSTGRES_PASSWORD: hydra_dev_2026           # test-only
+  ZOVARK_DB_PASSWORD: hydra_dev_2026          # test-only
+  ZOVARK_REDIS_PASSWORD: hydra-redis-dev-2026 # test-only
+  ZOVARK_LLM_KEY: sk-ci-coverage-test-only-not-a-real-key
+
 jobs:
   coverage:
     runs-on: ubuntu-latest

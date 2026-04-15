@@ -1,0 +1,3 @@
+Store failed: column "model_name" of relation "agent_tasks" does not exist
+LINE 7:                 model_name = 'unknown',
+                        ^

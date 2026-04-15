@@ -6,6 +6,21 @@ on:
   pull_request:
     branches: [master, main]
 
+# stabilize-runtime-hygiene (2026-04-15):
+# test-only — these are ephemeral CI fixtures that boot isolated containers.
+# Not real secrets. docker-compose.yml now requires every credential variable
+# (no `:-` fallbacks), so the same values previously baked into compose must
+# be declared here for `docker compose config` / `up -d` to succeed.
+env:
+  POSTGRES_PASSWORD: hydra_dev_2026           # test-only
+  ZOVARK_DB_PASSWORD: hydra_dev_2026          # test-only
+  REDIS_PASSWORD: hydra-redis-dev-2026        # test-only
+  ZOVARK_REDIS_PASSWORD: hydra-redis-dev-2026 # test-only
+  SURREAL_ROOT_PASSWORD: ci-surreal-root-test-only
+  MINIO_ROOT_PASSWORD: ci-minio-root-test-only
+  JWT_SECRET: ci-jwt-secret-test-only-32chars-minimum-do-not-use-in-prod
+  ZOVARK_LLM_KEY: sk-ci-test-only-not-a-real-key
+
 jobs:
   # ─── Job 1: Unit Tests (no Docker, no LLM) ──────────────
   unit-tests:
@@ -20,22 +35,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Python setup
+      # Python setup (audit 3.34: cache pip wheels between runs)
       - uses: actions/setup-python@v5
         if: matrix.lang == 'python'
         with:
           python-version: '3.11'
+          cache: 'pip'
       - name: Install Python dependencies
         if: matrix.lang == 'python'
         run: |
           pip install pytest pytest-cov
           pip install psycopg2-binary redis pyyaml httpx
 
-      # Go setup
+      # Go setup (audit 3.34: build/module cache is on by default in v5)
       - uses: actions/setup-go@v5
         if: matrix.lang == 'go'
         with:
           go-version: '1.22'
+          cache: true
 
       # Python unit tests
       - name: Run Python unit tests
@@ -155,6 +172,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
       - name: Install test dependencies
         run: |
@@ -182,6 +200,34 @@ jobs:
             fi
             sleep 5
           done
+
+      - name: Verify fixture users seeded
+        # database-seed-system: fails loud if migrations/seed_dev_data.sql
+        # didn't run (e.g. mount path typo or stale postgres volume). This
+        # catches "missing fixture" before the auth-dependent tests below
+        # surface as misleading 401 errors.
+        run: |
+          scripts/seed_dev.sh --check
+
+      - name: Stack healthcheck
+        # Probe every runtime component in one shot. exit 0 = all pass,
+        # exit 2 = degraded (CI tolerates for cold trace ingestion on test stack),
+        # exit 1 = hard failure (job fails). Profiles not in docker-compose.test.yml
+        # are skipped so they never regress the gate.
+        env:
+          REDIS_PASSWORD: hydra-redis-dev-2026
+        run: |
+          set +e
+          scripts/stack_healthcheck.sh --json --skip signoz,redpanda,healer,dashboard
+          rc=$?
+          set -e
+          if [ $rc -eq 1 ]; then
+            echo "Stack healthcheck reported hard failures"
+            exit 1
+          fi
+          if [ $rc -eq 2 ]; then
+            echo "Stack healthcheck degraded (non-blocking on CI)"
+          fi
 
       - name: Verify mock LLM is responding
         run: |
@@ -223,9 +269,10 @@ jobs:
           echo "Task response: $RESPONSE"
 
       - name: Run integration test suite
+        # Audit 3.36: drop `|| true` — integration failures must fail the job.
         run: |
           if [ -d "tests/integration" ]; then
-            python -m pytest tests/integration/ -v --tb=short || true
+            python -m pytest tests/integration/ -v --tb=short
           else
             echo "No integration test directory found, skipping"
           fi

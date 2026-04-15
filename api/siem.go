@@ -64,7 +64,8 @@ func webhookAlertHandler(c *gin.Context) {
 	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write(body)
 	expected := hex.EncodeToString(mac.Sum(nil))
-	if sig != expected {
+	// Constant-time comparison — prevents timing side-channel on signature forgery.
+	if !hmac.Equal([]byte(sig), []byte(expected)) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid webhook signature"})
 		return
 	}
@@ -263,7 +264,9 @@ func autoInvestigateAlert(ctx context.Context, tenantID, alertID string, ocsf ma
 	pubCtx, pubCancel := context.WithTimeout(ctx, 15*time.Second)
 	defer pubCancel()
 	if err := publishTaskNew(pubCtx, tenantID, taskID, taskType, input); err != nil {
-		_, _ = dbPool.Exec(ctx, "UPDATE agent_tasks SET status = 'failed' WHERE id = $1", taskID)
+		cleanCtx, cleanCancel := detachedCleanupCtx()
+		_, _ = dbPool.Exec(cleanCtx, "UPDATE agent_tasks SET status = 'failed' WHERE id = $1", taskID)
+		cleanCancel()
 		return "", fmt.Errorf("failed to publish task to redpanda: %w", err)
 	}
 	recordWorkflowStart(ctx, "task-"+taskID)

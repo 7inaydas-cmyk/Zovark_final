@@ -11,18 +11,11 @@ from typing import Optional
 import httpx
 
 ZOVARK_LLM_ENDPOINT = os.environ.get("ZOVARK_LLM_ENDPOINT", "https://api.openai.com/v1/chat/completions")
-try:
-    from settings import settings as _settings
-    from llm_client import resolve_llm_api_key as _resolve_llm_api_key
-    ZOVARK_LLM_KEY = _resolve_llm_api_key(None)
-    DATABASE_URL = os.environ.get("DATABASE_URL", _settings.database_url)
-except ImportError:
-    ZOVARK_LLM_KEY = (
-        os.environ.get("OPENAI_API_KEY", "").strip()
-        or os.environ.get("ZOVARK_OPENAI_API_KEY", "").strip()
-        or os.environ.get("ZOVARK_LLM_KEY", "").strip()
-    )
-    DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://zovark:hydra_dev_2026@pgbouncer:5432/zovark")
+# stabilize-runtime-hygiene: centralized LLM key + DB URL via settings.
+from settings import settings as _settings
+from llm_client import resolve_llm_api_key as _resolve_llm_api_key
+ZOVARK_LLM_KEY = _resolve_llm_api_key(None)
+DATABASE_URL = os.environ.get("DATABASE_URL", _settings.database_url)
 
 # Two-model routing: Gemma 4 E4B (dev: same model both roles, customer: bigger CODE)
 # FAST: tool selection + param extraction (Path B/C)
@@ -37,8 +30,22 @@ ENDPOINT_FAST = os.environ.get("ZOVARK_LLM_ENDPOINT_FAST", _DEFAULT_ENDPOINT)
 ENDPOINT_CODE = os.environ.get("ZOVARK_LLM_ENDPOINT_CODE", _DEFAULT_ENDPOINT)
 
 
-def _get_endpoint_for_model(model: str) -> str:
-    """Route model to the correct inference endpoint."""
+def _get_endpoint_for_model(model: str, role: str = "") -> str:
+    """Route to the correct inference endpoint.
+
+    Audit 2.9: prefer routing by semantic role ("verdict"/"summary" → CODE,
+    "tool_select"/"param_fill" → FAST). Falling back to model-name equality
+    silently sent every call to ENDPOINT_FAST when both models share a default
+    (the dev tier defaults `MODEL_FAST == MODEL_CODE == "gpt-4o-mini"`, making
+    the model-equality branch always match FAST and ignoring any
+    ZOVARK_LLM_ENDPOINT_CODE override).
+    """
+    r = (role or "").lower().strip()
+    if r in ("verdict", "summary", "code"):
+        return ENDPOINT_CODE
+    if r in ("tool_select", "param_fill", "fast"):
+        return ENDPOINT_FAST
+    # No role hint — fall back to model-name equality (legacy behaviour).
     if model == MODEL_FAST:
         return ENDPOINT_FAST
     return ENDPOINT_CODE
@@ -76,8 +83,15 @@ async def llm_call(
     Returns: {"content": str, "tokens_in": int, "tokens_out": int, "latency_ms": int, "model": str, "prompt_version": str}
     """
     model_name = model_config.get("model", model_config.get("name", "unknown"))
+    # Resolve role eagerly so endpoint routing is role-aware (audit 2.9).
+    _role_hint = role
+    if not _role_hint:
+        if stage == "assess":
+            _role_hint = "verdict"
+        elif stage == "analyze":
+            _role_hint = "tool_select"
     # Env-based FAST/CODE URLs (ZOVARK_LLM_ENDPOINT_*) — avoids stale YAML hostnames in Docker.
-    endpoint = _get_endpoint_for_model(model_name)
+    endpoint = _get_endpoint_for_model(model_name, _role_hint)
     api_key = model_config.get("api_key", ZOVARK_LLM_KEY)
 
     request_body = {

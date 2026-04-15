@@ -58,6 +58,18 @@ def _return_connection(conn, tier="normal"):
     """Return a connection to its pool (or close if no pool)."""
     pool = _pools.get(tier) or _pools.get("normal")
     if pool is not None:
+        try:
+            pool.putconn(conn)
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    else:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def _get_llm_key() -> str:
@@ -67,12 +79,6 @@ def _get_llm_key() -> str:
         return os.environ.get("ZOVARK_LLM_KEY", _s.llm_key.get_secret_value())
     except Exception:
         return os.environ.get("ZOVARK_LLM_KEY", "")
-        try:
-            pool.putconn(conn)
-        except Exception:
-            _return_connection(conn)
-    else:
-        _return_connection(conn)
 
 
 def _sync_commit(cur):
@@ -1220,9 +1226,16 @@ async def decrement_active_activity(data: dict) -> None:
     """Release the lease for this task."""
     from rate_limiter import release_lease
     if isinstance(data, str):
-        # Backwards compat: old callers pass tenant_id as string
-        from redis_client import decrement_active
-        decrement_active(data)
+        # Backwards compat: old callers pass tenant_id as string.
+        # Inlined from the removed worker/redis_client.py::decrement_active.
+        import redis
+        from settings import settings
+        r = redis.from_url(settings.redis_url, decode_responses=True)
+        key = f"zovark:active:{data}"
+        val = r.decr(key)
+        if val < 0:
+            r.set(key, 0)
+            r.expire(key, 3600)
         return
     release_lease(data["tenant_id"], data["task_id"])
 

@@ -182,8 +182,18 @@ func ssoLoginHandler(c *gin.Context) {
 	stateKey := "oidc_state:" + sessionID
 	verifierKey := "oidc_verifier:" + sessionID
 	if redisClient != nil {
-		_ = redisClient.SetEx(c.Request.Context(), stateKey, state, 600*time.Second)
-		_ = redisClient.SetEx(c.Request.Context(), verifierKey, verifier, 600*time.Second)
+		// Fail fast on Redis error — silent SetEx failures make the callback appear to succeed
+		// right up until it can't find the state key, surfacing as "invalid_state" on the user side.
+		if err := redisClient.SetEx(c.Request.Context(), stateKey, state, 600*time.Second).Err(); err != nil {
+			log.Printf("[OIDC] SetEx state failed: %v", err)
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "oidc state store unavailable"})
+			return
+		}
+		if err := redisClient.SetEx(c.Request.Context(), verifierKey, verifier, 600*time.Second).Err(); err != nil {
+			log.Printf("[OIDC] SetEx verifier failed: %v", err)
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "oidc state store unavailable"})
+			return
+		}
 	}
 	// Store only the session ID in the cookie (not the state value itself)
 	c.SetCookie("oidc_session", sessionID, 600, "/", "", secureCookie, true)

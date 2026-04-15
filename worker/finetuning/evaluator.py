@@ -15,7 +15,10 @@ ZOVARK_LLM_ENDPOINT = os.environ.get(
     "ZOVARK_LLM_ENDPOINT",
     "http://zovark-inference:8080/v1/chat/completions",
 )
-ZOVARK_LLM_KEY = os.environ.get("ZOVARK_LLM_KEY", "sk-zovark-dev-2026")
+# stabilize-runtime-hygiene: centralized LLM key loading.
+# Pydantic raises ValidationError if ZOVARK_LLM_KEY is unset.
+from settings import settings as _settings
+ZOVARK_LLM_KEY = _settings.llm_key.get_secret_value()
 
 _REFERENCE_LIMIT = 50
 

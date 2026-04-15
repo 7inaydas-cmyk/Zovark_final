@@ -33,7 +33,7 @@ echo ""
 echo "3. Testing LiteLLM fallback to Ollama..."
 echo "   (Using airgap model name directly)"
 LLM_RESP=$(curl -sf http://localhost:4000/v1/chat/completions \
-  -H "Authorization: Bearer ${ZOVARK_LLM_KEY:-sk-zovark-dev-2026}" \
+  -H "Authorization: Bearer ${ZOVARK_LLM_KEY:?ZOVARK_LLM_KEY is required — source .env first}" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "zovark-fast-airgap",

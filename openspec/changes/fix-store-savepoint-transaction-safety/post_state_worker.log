@@ -1,0 +1,2 @@
+{"ts": 1776083212.47172, "level": "info", "msg": "Started workflow from Redpanda", "worker": "04beb8e45316-1-3d04", "workflow": "InvestigationWorkflowV2", "task_id": "4ac6136f-3cd6-42ad-9c22-7282364ab029"}
+Pattern save failed (non-fatal): column "task_type" of relation "investigation_memory" does not exist

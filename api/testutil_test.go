@@ -63,6 +63,8 @@ func setupTestRouter() *gin.Engine {
 
 		api.GET("/models", requireRole("admin"), listModelsHandler)
 		api.PUT("/models/:id", requireRole("admin"), updateModelHandler)
+
+		api.POST("/admin/diagnostics/probe-db", requireRole("admin"), probeDBHandler)
 	}
 
 	return router

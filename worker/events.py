@@ -38,8 +38,9 @@ def emit_event(
     """
     if data is None:
         data = {}
-    try:
-        payload = json.dumps({
+
+    def _build_payload() -> str:
+        return json.dumps({
             "event_type": event_type,
             "task_id": task_id,
             "tenant_id": tenant_id,
@@ -47,19 +48,34 @@ def emit_event(
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "data": data,
         })
-        # NOTIFY payload limit is 8000 bytes
-        if len(payload) > 7900:
+
+    try:
+        payload = _build_payload()
+        # Audit 2.22: measure payload in UTF-8 BYTES, not Python `len()`.
+        # Multibyte characters inflate the byte count 2–4×; a 7899-char string
+        # can be 32 KB of UTF-8, which blows past the 8000-byte NOTIFY limit.
+        def _bytes(s: str) -> int:
+            return len(s.encode("utf-8", errors="replace"))
+
+        if _bytes(payload) > 7900:
             for key in ("raw_details", "full_output", "raw_log", "stdout"):
                 data.pop(key, None)
             data["truncated"] = True
-            payload = json.dumps({
-                "event_type": event_type,
-                "task_id": task_id,
-                "tenant_id": tenant_id,
-                "trace_id": trace_id,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "data": data,
-            })
+            payload = _build_payload()
+
+        # Last-resort hard truncation — if even the trimmed payload is still
+        # over-size (e.g. many IOCs), drop the data body entirely.
+        if _bytes(payload) > 7900:
+            data.clear()
+            data["truncated"] = True
+            data["notice"] = "payload exceeded 8KB NOTIFY limit"
+            payload = _build_payload()
+            if _bytes(payload) > 7900:
+                logger.warning(
+                    "event %s dropped: unable to shrink payload below NOTIFY limit",
+                    event_type,
+                )
+                return
 
         conn = psycopg2.connect(_DB_URL)
         conn.autocommit = True

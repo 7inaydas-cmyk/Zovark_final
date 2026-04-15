@@ -33,13 +33,21 @@
 
 | Resource | Credential |
 |----------|------------|
-| Admin login | admin@test.local / TestPass2026 (tenant e1c1bc5d) |
-| Analyst login | analyst2@test.local / TestPass2026 (same tenant) |
+| Admin login | admin@test.local / TestPass2026 (tenant `…0010`, user `…0020`) |
+| Analyst login | analyst2@test.local / TestPass2026 (tenant `…0010`, user `…0021`) |
 | Database | user=zovark, password=hydra_dev_2026, db=zovark |
 | Redis | password=hydra-redis-dev-2026 |
 | LLM endpoint | `ZOVARK_LLM_ENDPOINT=http://zovark-inference:8080/v1/chat/completions` |
 | LLM key | `ZOVARK_LLM_KEY=sk-zovark-dev-2026` |
 | JWT | 30-minute access tokens |
+
+Fixture users are seeded automatically on fresh boot by `migrations/seed_dev_data.sql`
+(mounted into postgres at `/docker-entrypoint-initdb.d/02-seed-dev.sql`). To re-seed
+manually after wiping or accidentally deleting: `scripts/seed_dev.sh`. To verify the
+fixture state without running the e2e probe: `scripts/seed_dev.sh --check`.
+The reserved UUIDs `…0010` (dev tenant), `…0020` (admin), `…0021` (analyst) can be
+referenced as literals in tests and scripts — they are guaranteed stable across
+fresh volumes.
 
 DB and Redis passwords were intentionally not renamed during the rebrand (`hydra_dev_2026`, `hydra-redis-dev-2026`). Use these exact values in all docker/psql/redis-cli commands.
 
@@ -308,6 +316,8 @@ Everything else (os, sys, subprocess, socket, eval, exec, etc.) is blocked befor
 | Key tables | agent_tasks (has trace_id), investigations, agent_skills (25 templates), llm_audit_log, cipher_audit_events, audit_events (has trace_id), entities, entity_edges, detection_rules, response_playbooks, cross_tenant_entities, investigation_memory (SINGULAR name), template_promotion_approvals |
 
 Apply migrations: `docker compose exec -T postgres psql -U zovark -d zovark < migrations/NNN_name.sql`
+
+For batch application of all unapplied migrations against an existing volume, use `scripts/apply_migrations.sh` (ledger-aware, idempotent, gated on 068 SurrealDB cutover). See `docs/RUNBOOK_HEALTHCHECK.md#schema-drift`.
 
 ---
 
@@ -607,6 +617,32 @@ Key route groups on the Go API (port 8090):
 
 ---
 
+## Contributor Quickstart
+
+Three bash scripts codify the fork → branch → ship → sync loop:
+
+```bash
+# Start a fresh feature branch from upstream/master
+scripts/git_fresh.sh fix/my-thing
+
+# ... edit files ...
+
+# Commit, push, and print the PR compare URL
+# (runs go build + python3 -m py_compile on *changed* files only)
+scripts/git_ship.sh 'fix: my-thing description'
+
+# Pull in latest upstream changes (rebase + --force-with-lease push)
+scripts/git_sync.sh
+```
+
+All three are strict (`set -euo pipefail`), idempotent, and share a
+`--help` / `--no-color` / `--quiet` flag contract plus exit codes
+`0` = success, `1` = failure, `2` = no-op / degraded. Safety guarantees:
+`--force-with-lease` never `--force`, never pushes to `upstream`, never uses
+`--no-verify`. Bypass precommit with `ZOVARK_SKIP_PRECOMMIT=1`.
+
+---
+
 ## How to Run
 
 ```bash
@@ -617,7 +653,21 @@ docker compose up -d
 docker compose -f docker-compose.yml -f docker-compose.distroless.yml up -d
 # Wait ~60s for model load, verify: docker compose exec worker curl -sf http://zovark-inference:8080/health
 
-# Verify health + readiness
+# Verify the whole stack in one shot (API, dashboard, Signoz+trace ingestion,
+# healer, Redpanda, Valkey, Temporal, Postgres). Colored table + exit codes.
+REDIS_PASSWORD=hydra-redis-dev-2026 scripts/stack_healthcheck.sh
+# Or machine-readable: scripts/stack_healthcheck.sh --json
+
+# End-to-end pipeline probe — submits ONE synthetic alert and tracks it
+# through ingest → Redpanda → worker → Postgres → Signoz → verdict. Prints a
+# per-stage timeline with the stall point named on failure. Reserved task type
+# `probe_noop` runs a deterministic no-LLM plan so the probe never burns tokens.
+# Writes one tagged synthetic row to agent_tasks (dashboard hides it).
+scripts/e2e_probe.sh
+# Or chained onto the healthcheck:
+scripts/stack_healthcheck.sh --e2e
+
+# Fine-grained probes (covered by stack_healthcheck.sh above):
 curl -s http://localhost:8090/health
 curl -s http://localhost:8090/ready
 
@@ -720,8 +770,16 @@ Lab-only autonomous experimentation loops. Nothing enters production without hum
 - **Disable**: `OTEL_ENABLED=false` (pipeline works without tracing)
 - **Traces show**: per-stage latency, per-tool execution, LLM call timing, governance decisions
 - **Config files**: `config/signoz/` (ClickHouse cluster, OTEL collector, frontend nginx)
-- **First-time setup**: Run schema migrator once after ClickHouse starts:
-  `docker run --rm --network zovark_zovark-internal signoz/signoz-schema-migrator:0.111.16 --dsn "tcp://zovark-clickhouse:9000" sync`
+- **Schema migration (automated)**: `zovark-signoz-schema-sync` in `docker-compose.yml`
+  runs `signoz/signoz-schema-migrator sync` on first boot. The collector has
+  `depends_on: zovark-signoz-schema-sync: service_completed_successfully` so it
+  doesn't start until ClickHouse has the tables. **No manual migrator run is required**
+  (the instruction used to say otherwise — corrected by `telemetry-audit-fix`).
+- **Architecture reference**: `docs/TELEMETRY_ARCHITECTURE.md` has a file:line anchor
+  table for every wiring touchpoint (API → OTLP → collector → ClickHouse → Signoz UI).
+  Re-audit on every OTel SDK upgrade.
+- **Verify end-to-end**: `scripts/stack_healthcheck.sh --prime` (generates a warmup
+  span and confirms both `zovark-api` and `zovark-worker` are reporting traces).
 - **Streaming Waterfall**: real-time tool progress via PostgreSQL NOTIFY → SSE → React component
 
 ## MCP Servers for Development
@@ -767,6 +825,8 @@ Query: Ask natural language questions about the codebase
 9. **Mock Ollama in test stack** — `docker-compose.test.yml` uses `mock-ollama` container for CI. This is intentional (test fixture), not a production dependency.
 10. **Gemma 4 E4B requires >=12GB Docker memory** — Q4_K_M (5GB GGUF) needs ~7GB RAM with default 128K context. Fixed with `--ctx-size 4096` (reduces to ~2GB). Docker Desktop must be set to >=12GB for reliable operation. Uses `--jinja --reasoning off`. GBNF grammars verified working.
 11. **Healer memory leak** — On Windows Docker Desktop, healer can grow to 3GB+ with 5000+ PIDs (GIL + asyncio contention). Memory-limited to 512MB in docker-compose.yml. Restart healer if it hits the limit.
+12. **pgx + PgBouncer prepared statements** — Default `ZOVARK_PGX_QUERY_MODE=describe_exec`. Do not change without reading `docs/RUNBOOK_HEALTHCHECK.md#api-08p01`. The API's startup self-test (`api/db.go` `selfTestPool`) refuses to boot if the live pool is in a mode that triggers SQLSTATE `08P01` against PgBouncer transaction pooling.
+13. **Schema drift on dev volumes** — Migrations 054+ are not applied by docker-compose. Run `scripts/apply_migrations.sh` after a fresh `docker compose down -v && up -d`. The API logs `schema_migrations_check status=absent` if the ledger is missing. See `docs/RUNBOOK_HEALTHCHECK.md#schema-drift`. Migration 068 (SurrealDB cutover) is gated behind `--include-068`.
 
 ---
 

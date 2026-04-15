@@ -1,6 +1,10 @@
 # Zovark E2E Test Stack
 # Minimal services needed for end-to-end testing
 # Usage: docker compose -f tests/e2e/docker-compose.test.yml up -d
+#
+# test-only: All credentials in this file are ephemeral CI / e2e fixtures,
+# not real secrets. Exempted from stabilize-runtime-hygiene secret policy
+# because this file boots an isolated test stack and never touches production.
 
 services:
   postgres:

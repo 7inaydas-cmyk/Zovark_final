@@ -1,0 +1,68 @@
+=== TABLES ===
+         name         | exists 
+----------------------+--------
+ agent_tasks          |      1
+ investigation_memory |      1
+ investigations       |      1
+ audit_events         |      1
+(4 rows)
+
+=== agent_tasks COLUMNS ===
+        name        | exists 
+--------------------+--------
+ id                 |      1
+ dedup_hash         |      1
+ status             |      1
+ output             |      1
+ error_message      |      1
+ tokens_used_input  |      1
+ tokens_used_output |      1
+ execution_ms       |      1
+ severity           |      1
+ worker_id          |      1
+ needs_human_review |      1
+ review_reason      |      1
+ model_name         |       
+ path_taken         |      1
+ generated_code     |      1
+ completed_at       |      1
+(16 rows)
+
+=== investigation_memory COLUMNS ===
+      name       | exists 
+-----------------+--------
+ task_type       |       
+ alert_signature |       
+ code_template   |       
+ iocs_found      |       
+ findings_found  |       
+ risk_score      |      1
+ success         |       
+(7 rows)
+
+=== investigations COLUMNS ===
+    name    | exists 
+------------+--------
+ id         |      1
+ tenant_id  |      1
+ task_id    |      1
+ verdict    |      1
+ risk_score |      1
+ confidence |      1
+ summary    |      1
+ source     |      1
+ model_name |       
+(9 rows)
+
+=== audit_events COLUMNS ===
+     name      | exists 
+---------------+--------
+ tenant_id     |      1
+ event_type    |      1
+ actor_type    |      1
+ resource_type |      1
+ resource_id   |      1
+ metadata      |      1
+ trace_id      |      1
+(7 rows)
+

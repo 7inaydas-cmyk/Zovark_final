@@ -8,6 +8,7 @@ Does NOT import from _legacy_activities.py or entity_graph.py.
 import os
 import json
 import time
+from contextlib import contextmanager
 from dataclasses import asdict
 
 import psycopg2
@@ -16,15 +17,13 @@ from temporalio import activity
 from stages import StoreOutput
 from stages.trace_helpers import trace_stage_store_span, trace_store_apply_outcome
 
-try:
-    from settings import settings as _settings
-    DATABASE_URL = os.environ.get("DATABASE_URL", _settings.database_url)
-except ImportError:
-    DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://zovark:hydra_dev_2026@pgbouncer:5432/zovark")
+# stabilize-runtime-hygiene: centralized DB/Redis URL via settings.
+from settings import settings as _settings
+DATABASE_URL = os.environ.get("DATABASE_URL", _settings.database_url)
 FAST_FILL = os.environ.get("ZOVARK_FAST_FILL", "false").lower() == "true"
 
 
-REDIS_URL = os.environ.get("REDIS_URL", "redis://:hydra-redis-dev-2026@redis:6379/0")
+REDIS_URL = os.environ.get("REDIS_URL", _settings.redis_url)
 
 
 def _get_redis():
@@ -45,14 +44,15 @@ def _update_dedup_entry(conn, task_id: str, verdict: str, risk_score: int, statu
             return
         alert_hash = None
         try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT dedup_hash FROM agent_tasks WHERE id = %s",
-                    (task_id,),
-                )
-                row = cur.fetchone()
-                if row and row[0]:
-                    alert_hash = row[0]
+            with _savepoint(conn, "sp_update_dedup_entry"):
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT dedup_hash FROM agent_tasks WHERE id = %s",
+                        (task_id,),
+                    )
+                    row = cur.fetchone()
+                    if row and row[0]:
+                        alert_hash = row[0]
         except Exception:
             pass
         if not alert_hash:
@@ -79,7 +79,88 @@ def _update_dedup_entry(conn, task_id: str, verdict: str, risk_score: int, statu
 
 
 def _get_db():
+    """Deprecated shim. Audit 2.3: new code should use `with _db_conn() as conn:`
+    so the connection is returned to the pool on every exit path."""
+    if _USE_POOL:
+        from database.pool_manager import _pools
+        pool = _pools.get("normal") or _pools.get("critical")
+        if pool is not None:
+            return pool.getconn()
     return psycopg2.connect(DATABASE_URL)
+
+
+# Audit 2.3: route store_investigation through the pooled connection helper so
+# the worker doesn't open a fresh socket on every investigation. Context
+# manager ensures putconn() runs on both success and exception paths.
+try:
+    from database.pool_manager import pooled_connection as _pooled_connection  # noqa: F401
+    _USE_POOL = True
+except ImportError:
+    _USE_POOL = False
+
+
+@contextmanager
+def _db_conn():
+    """Yield a DB connection and return it to the pool on exit."""
+    if _USE_POOL:
+        from database.pool_manager import _pools
+        pool = _pools.get("normal") or _pools.get("critical")
+        if pool is not None:
+            conn = pool.getconn()
+            try:
+                yield conn
+            finally:
+                try:
+                    pool.putconn(conn)
+                except Exception:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+            return
+    conn = psycopg2.connect(DATABASE_URL)
+    try:
+        yield conn
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@contextmanager
+def _savepoint(conn, name):
+    """Wrap a block in a Postgres SAVEPOINT so cursor failures inside the block
+    do not poison the parent transaction. On exception, ROLLBACK TO SAVEPOINT and
+    re-raise so the surrounding try/except still observes the Python exception."""
+    with conn.cursor() as cur:
+        cur.execute(f"SAVEPOINT {name}")
+    try:
+        yield
+    except Exception:
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"ROLLBACK TO SAVEPOINT {name}")
+        except Exception:
+            pass
+        raise
+    else:
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"RELEASE SAVEPOINT {name}")
+        except Exception:
+            pass
+
+
+# Audit 2.2: UUID validator for SET LOCAL app.current_tenant interpolation.
+import uuid as _uuid  # noqa: E402
+
+
+def validate_tenant_id(tenant_id: str) -> str:
+    if not isinstance(tenant_id, str) or not tenant_id:
+        raise ValueError("tenant_id must be a non-empty string")
+    _uuid.UUID(tenant_id)
+    return tenant_id
 
 
 def _get_worker_id():
@@ -146,17 +227,18 @@ def _save_pattern(conn, task_type: str, alert_sig: str, code: str,
                   iocs: list, findings: list, risk_score: int, success: bool):
     """Save investigation pattern to memory table. No LLM."""
     try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO investigation_memory
-                (task_type, alert_signature, code_template, iocs_found,
-                 findings_found, risk_score, success)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-            """, (
-                task_type, alert_sig, (code or "")[:10000],
-                json.dumps(iocs), json.dumps(findings),
-                risk_score, success,
-            ))
+        with _savepoint(conn, "sp_save_pattern"):
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO investigation_memory
+                    (task_type, alert_signature, code_template, iocs_found,
+                     findings_found, risk_score, success)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    task_type, alert_sig, (code or "")[:10000],
+                    json.dumps(iocs), json.dumps(findings),
+                    risk_score, success,
+                ))
     except Exception as e:
         print(f"Pattern save failed (non-fatal): {e}")
 
@@ -168,19 +250,20 @@ def _create_investigation(conn, tenant_id: str, task_id: str, verdict: str,
     """Insert investigations row without embedding. Uses synchronous_commit for durability.
     Returns investigation_id."""
     try:
-        with conn.cursor() as cur:
-            # Critical write: ensure WAL flush before acknowledging
-            cur.execute("SET LOCAL synchronous_commit = on;")
-            cur.execute("""
-                INSERT INTO investigations
-                (tenant_id, task_id, verdict, risk_score, confidence,
-                 summary, source, model_name)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                RETURNING id
-            """, (tenant_id, task_id, verdict, risk_score, confidence,
-                  (summary or "")[:2000], "production", model_name))
-            row = cur.fetchone()
-            return str(row[0]) if row else None
+        with _savepoint(conn, "sp_create_investigation"):
+            with conn.cursor() as cur:
+                # Critical write: ensure WAL flush before acknowledging
+                cur.execute("SET LOCAL synchronous_commit = on;")
+                cur.execute("""
+                    INSERT INTO investigations
+                    (tenant_id, task_id, verdict, risk_score, confidence,
+                     summary, source, model_name)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id
+                """, (tenant_id, task_id, verdict, risk_score, confidence,
+                      (summary or "")[:2000], "production", model_name))
+                row = cur.fetchone()
+                return str(row[0]) if row else None
     except Exception as e:
         print(f"Investigation insert failed (non-fatal): {e}")
         return None
@@ -192,16 +275,17 @@ def _insert_audit_event(conn, tenant_id: str, event_type: str,
                         metadata: dict = None, trace_id: str = ""):
     """Insert audit_events row. Non-fatal on failure."""
     try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO audit_events
-                (tenant_id, event_type, actor_type, resource_type, resource_id, metadata, trace_id)
-                VALUES (%s, %s, 'worker', %s, %s, %s, %s)
-            """, (
-                tenant_id, event_type, resource_type,
-                resource_id, json.dumps(metadata or {}),
-                trace_id or None,
-            ))
+        with _savepoint(conn, "sp_insert_audit_event"):
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO audit_events
+                    (tenant_id, event_type, actor_type, resource_type, resource_id, metadata, trace_id)
+                    VALUES (%s, %s, 'worker', %s, %s, %s, %s)
+                """, (
+                    tenant_id, event_type, resource_type,
+                    resource_id, json.dumps(metadata or {}),
+                    trace_id or None,
+                ))
     except Exception as e:
         print(f"Audit event insert failed (non-fatal): {e}")
 
@@ -270,15 +354,20 @@ async def _store_investigation_body(data: dict, _span) -> dict:
     severity = _severity_from_risk(risk_score)
     investigation_id = None
 
-    conn = _get_db()
-    try:
-        # Set RLS tenant context for this transaction
-        # Use string format (not parameterized) because SET LOCAL doesn't
-        # support $1 params through PgBouncer transaction pooling.
-        # tenant_id is a UUID from the workflow, not user input.
+    # Audit 2.3: pooled connection (ctx manager returns it to the pool on exit).
+    # Audit 2.2: tenant_id validated via uuid.UUID before SET LOCAL interpolation.
+    with _db_conn() as conn:
+      try:
         if tenant_id:
-            with conn.cursor() as cur:
-                cur.execute(f"SET LOCAL app.current_tenant = '{tenant_id}'")
+            try:
+                validated_tid = validate_tenant_id(tenant_id)
+                with conn.cursor() as cur:
+                    cur.execute(f"SET LOCAL app.current_tenant = '{validated_tid}'")
+            except ValueError as ve:
+                activity.logger.error(
+                    f"store_investigation: invalid tenant_id '{tenant_id}' ({ve}) — aborting"
+                )
+                return {"status": "error", "error": "invalid_tenant_id"}
 
         # 0. Audit: investigation_started
         if tenant_id:
@@ -352,15 +441,16 @@ async def _store_investigation_body(data: dict, _span) -> dict:
         # NOTIFY for SSE real-time updates (Mission 9)
         if status == "completed" and tenant_id:
             try:
-                with conn.cursor() as cur:
-                    notify_payload = json.dumps({
-                        "task_id": task_id,
-                        "tenant_id": tenant_id,
-                        "verdict": verdict,
-                        "risk_score": risk_score,
-                        "task_type": task_type,
-                    })
-                    cur.execute("NOTIFY task_completed, %s", (notify_payload,))
+                with _savepoint(conn, "sp_notify_task_completed"):
+                    with conn.cursor() as cur:
+                        notify_payload = json.dumps({
+                            "task_id": task_id,
+                            "tenant_id": tenant_id,
+                            "verdict": verdict,
+                            "risk_score": risk_score,
+                            "task_type": task_type,
+                        })
+                        cur.execute("NOTIFY task_completed, %s", (notify_payload,))
             except Exception as notify_err:
                 print(f"NOTIFY failed (non-fatal): {notify_err}")
 
@@ -384,12 +474,11 @@ async def _store_investigation_body(data: dict, _span) -> dict:
             )
         except Exception as dp_err:
             print(f"[DATA_PLANE] emit failed (non-fatal): {dp_err}")
-    except Exception as e:
+      except Exception as e:
         conn.rollback()
         print(f"Store failed: {e}")
         status = "failed"
-    finally:
-        conn.close()
+    # _db_conn context manager returns the connection to the pool on exit.
 
     result = StoreOutput(
         task_id=task_id,

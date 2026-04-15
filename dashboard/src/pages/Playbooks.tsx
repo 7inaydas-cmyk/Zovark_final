@@ -15,7 +15,16 @@ export default function Playbooks() {
     const [description, setDescription] = useState('');
     const [icon, setIcon] = useState('🔍');
     const [taskType, setTaskType] = useState('log_analysis');
-    const [steps, setSteps] = useState<string[]>(['']);
+    // Audit 4.9: each step carries a stable id so React's reconciliation
+    // doesn't reuse the wrong <textarea> DOM node when a step is removed or
+    // reordered. `genStepId` is a cheap monotonic fallback for environments
+    // without `crypto.randomUUID`.
+    type Step = { id: string; text: string };
+    const genStepId = () =>
+        (typeof crypto !== 'undefined' && 'randomUUID' in crypto)
+            ? crypto.randomUUID()
+            : `step-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const [steps, setSteps] = useState<Step[]>([{ id: genStepId(), text: '' }]);
     const [override, setOverride] = useState('');
     const [submitting, setSubmitting] = useState(false);
 
@@ -49,9 +58,9 @@ export default function Playbooks() {
         e.preventDefault();
         setSubmitting(true);
         try {
-            const validSteps = steps.filter(s => s.trim().length > 0);
-            if (validSteps.length === 0) throw new Error("At least one step is required");
-            if (validSteps.length > 3) throw new Error("Maximum 3 steps allowed");
+            const validTexts = steps.map(s => s.text).filter(s => s.trim().length > 0);
+            if (validTexts.length === 0) throw new Error("At least one step is required");
+            if (validTexts.length > 3) throw new Error("Maximum 3 steps allowed");
 
             await createPlaybook({
                 name,
@@ -59,11 +68,12 @@ export default function Playbooks() {
                 icon,
                 task_type: taskType,
                 system_prompt_override: override || undefined,
-                steps: validSteps
+                steps: validTexts
             });
             setShowForm(false);
             // Reset form
-            setName(''); setDescription(''); setIcon('🔍'); setTaskType('log_analysis'); setSteps(['']); setOverride('');
+            setName(''); setDescription(''); setIcon('🔍'); setTaskType('log_analysis');
+            setSteps([{ id: genStepId(), text: '' }]); setOverride('');
             await loadData();
         } catch (err: any) {
             alert(err.message || 'Failed to create playbook');
@@ -73,18 +83,18 @@ export default function Playbooks() {
     };
 
     const addStep = () => {
-        if (steps.length < 3) setSteps([...steps, '']);
+        if (steps.length < 3) setSteps([...steps, { id: genStepId(), text: '' }]);
     };
 
     const updateStep = (index: number, val: string) => {
-        const newSteps = [...steps];
-        newSteps[index] = val;
+        const newSteps = steps.slice();
+        newSteps[index] = { ...newSteps[index], text: val };
         setSteps(newSteps);
     };
 
     const removeStep = (index: number) => {
         if (steps.length > 1) {
-            const newSteps = [...steps];
+            const newSteps = steps.slice();
             newSteps.splice(index, 1);
             setSteps(newSteps);
         }
@@ -274,14 +284,14 @@ export default function Playbooks() {
 
                                 <div className="space-y-4">
                                     {steps.map((step, index) => (
-                                        <div key={index} className="flex space-x-3 items-start relative pb-2">
+                                        <div key={step.id} className="flex space-x-3 items-start relative pb-2">
                                             <div className="shrink-0 w-8 h-8 rounded-full bg-cyan-500/10 text-cyan-400 font-bold flex items-center justify-center border border-cyan-500/20 mt-1">
                                                 {index + 1}
                                             </div>
                                             <div className="flex-1">
                                                 <textarea
                                                     required rows={2}
-                                                    value={step}
+                                                    value={step.text}
                                                     onChange={e => updateStep(index, e.target.value)}
                                                     className="w-full bg-[#1E293B] border border-slate-700 rounded-lg px-4 py-3 text-sm text-white focus:outline-none focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500 resize-none"
                                                     placeholder={`Instructions for step ${index + 1}...`}

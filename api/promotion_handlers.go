@@ -44,8 +44,14 @@ func promotionQueueHandler(c *gin.Context) {
 		LIMIT 50
 	`, tenantID)
 	if err != nil {
-		// View may not exist yet — return empty gracefully
-		c.JSON(http.StatusOK, gin.H{"items": []interface{}{}, "total": 0, "awaiting_review": 0})
+		// Differentiate "relation does not exist" (42P01, fresh DB) from real pg errors
+		// (permission denied, pool exhausted, deadlock). Silently returning empty for the
+		// latter hides real failures.
+		if isRelationMissing(err) {
+			c.JSON(http.StatusOK, gin.H{"items": []interface{}{}, "total": 0, "awaiting_review": 0})
+			return
+		}
+		respondInternalError(c, err, "query promotion queue")
 		return
 	}
 	defer rows.Close()
@@ -204,22 +210,31 @@ func analystFeedbackHandler(c *gin.Context) {
 		return
 	}
 
-	// Update the task verdict to reflect analyst decision
-	updateOutput := fmt.Sprintf(
-		`jsonb_set(jsonb_set(COALESCE(output, '{}'::jsonb), '{verdict}', '"%s"'), '{analyst_reviewed}', 'true')`,
-		req.AnalystVerdict,
-	)
+	// Update the task verdict to reflect analyst decision.
+	// Bound parameters for jsonb_set — even though AnalystVerdict is whitelisted today,
+	// a future relaxation of the allowed values would reintroduce injection.
 	if req.AnalystRisk != nil {
-		updateOutput = fmt.Sprintf(
-			`jsonb_set(%s, '{risk_score}', '%d')`,
-			updateOutput, *req.AnalystRisk,
-		)
+		_, err = tx.Exec(ctx, `
+			UPDATE agent_tasks
+			SET output = jsonb_set(
+			  jsonb_set(
+			    jsonb_set(COALESCE(output, '{}'::jsonb), '{verdict}', to_jsonb($3::text)),
+			    '{analyst_reviewed}', 'true'::jsonb
+			  ),
+			  '{risk_score}', to_jsonb($4::int)
+			)
+			WHERE id = $1 AND tenant_id = $2
+		`, req.TaskID, tenantID, req.AnalystVerdict, *req.AnalystRisk)
+	} else {
+		_, err = tx.Exec(ctx, `
+			UPDATE agent_tasks
+			SET output = jsonb_set(
+			  jsonb_set(COALESCE(output, '{}'::jsonb), '{verdict}', to_jsonb($3::text)),
+			  '{analyst_reviewed}', 'true'::jsonb
+			)
+			WHERE id = $1 AND tenant_id = $2
+		`, req.TaskID, tenantID, req.AnalystVerdict)
 	}
-
-	_, err = tx.Exec(ctx, fmt.Sprintf(
-		"UPDATE agent_tasks SET output = %s WHERE id = $1 AND tenant_id = $2",
-		updateOutput,
-	), req.TaskID, tenantID)
 	if err != nil {
 		respondInternalError(c, err, "update task verdict from analyst feedback")
 		return
@@ -377,8 +392,11 @@ func autoTemplatesHandler(c *gin.Context) {
 		ORDER BY promoted_at DESC
 	`, tenantID)
 	if err != nil {
-		// Table columns may not exist yet — return empty gracefully
-		c.JSON(http.StatusOK, gin.H{"items": []interface{}{}, "count": 0})
+		if isRelationMissing(err) {
+			c.JSON(http.StatusOK, gin.H{"items": []interface{}{}, "count": 0})
+			return
+		}
+		respondInternalError(c, err, "query auto-promoted skills")
 		return
 	}
 	defer rows.Close()

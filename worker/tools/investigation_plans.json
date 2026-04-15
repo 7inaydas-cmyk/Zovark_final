@@ -1,319 +1,1500 @@
 {
-    "brute_force": {
-        "description": "Investigate brute force / credential stuffing attacks by counting failed auth attempts, extracting source IPs, and scoring based on volume and source diversity",
-        "plan": [
-            {"tool": "parse_auth_log", "args": {"raw_log": "$raw_log"}},
-            {"tool": "extract_ipv4", "args": {"text": "$raw_log"}},
-            {"tool": "extract_usernames", "args": {"text": "$raw_log"}},
-            {"tool": "count_pattern", "args": {"text": "$raw_log", "pattern": "(?i)fail|denied|invalid|error|rejected"}},
-            {
-                "condition": "$step4 > 50",
-                "if_true": {"tool": "score_brute_force", "args": {"failed_count": "$step4", "unique_sources": "$step2.count", "timespan_minutes": 60}},
-                "if_false": {"tool": "score_brute_force", "args": {"failed_count": "$step4", "unique_sources": "$step2.count", "timespan_minutes": 120}}
-            },
-            {"tool": "correlate_with_history", "args": {"ioc_values": "$step2", "lookback_hours": 72, "history_context": "$correlation_context"}},
-            {"tool": "map_mitre", "args": {"technique_ids": ["T1110", "T1110.001", "T1110.003"]}}
-        ]
-    },
-    "phishing_investigation": {
-        "description": "Investigate phishing attempts by extracting URLs, domains, and email addresses, detecting credential harvesting, and scoring phishing indicators",
-        "plan": [
-            {"tool": "extract_urls", "args": {"text": "$raw_log"}},
-            {"tool": "extract_domains", "args": {"text": "$raw_log"}},
-            {"tool": "extract_emails", "args": {"text": "$raw_log"}},
-            {"tool": "detect_phishing", "args": {"siem_event": "$siem_event"}},
-            {"tool": "count_pattern", "args": {"text": "$raw_log", "pattern": "(?i)urgent|immediate|verify.*account|suspend|expire|click\\s+here|act\\s+now"}},
-            {"tool": "count_pattern", "args": {"text": "$raw_log", "pattern": "(?i)login|password|credential|verify|secure.*login"}},
-            {
-                "condition": "$step6 > 0",
-                "if_true": {"tool": "score_phishing", "args": {"url_count": "$step1.count", "suspicious_domains": "$step2.count", "has_credential_form": true, "has_urgency_language": true}},
-                "if_false": {"tool": "score_phishing", "args": {"url_count": "$step1.count", "suspicious_domains": "$step2.count", "has_credential_form": false, "has_urgency_language": false}}
-            },
-            {"tool": "lookup_known_bad", "args": {"value": "$siem_event.source_ip", "ioc_type": "ip"}},
-            {"tool": "correlate_with_history", "args": {"ioc_values": "$step2", "lookback_hours": 168, "history_context": "$correlation_context"}},
-            {"tool": "map_mitre", "args": {"technique_ids": ["T1566", "T1566.001", "T1566.002"]}}
-        ]
-    },
-    "ransomware_triage": {
-        "description": "Triage ransomware incidents by detecting shadow copy deletion, mass encryption patterns, and extracting IOCs from process execution logs",
-        "plan": [
-            {"tool": "parse_windows_event", "args": {"raw_log": "$raw_log"}},
-            {"tool": "extract_ipv4", "args": {"text": "$raw_log"}},
-            {"tool": "extract_hashes", "args": {"text": "$raw_log"}},
-            {"tool": "detect_ransomware", "args": {"siem_event": "$siem_event"}},
-            {"tool": "count_pattern", "args": {"text": "$raw_log", "pattern": "(?i)vssadmin|shadow|encrypt|ransom|bcdedit|wbadmin|delete|cipher"}},
-            {"tool": "lookup_known_bad", "args": {"value": "$siem_event.source_ip", "ioc_type": "ip"}},
-            {"tool": "correlate_with_history", "args": {"ioc_values": "$step3", "lookback_hours": 24, "history_context": "$correlation_context"}},
-            {"tool": "map_mitre", "args": {"technique_ids": ["T1486", "T1490", "T1027"]}}
-        ]
-    },
-    "data_exfiltration_detection": {
-        "description": "Detect data exfiltration by analyzing transfer volumes, destination IPs, encoding patterns, and off-hours activity",
-        "plan": [
-            {"tool": "extract_ipv4", "args": {"text": "$raw_log"}},
-            {"tool": "extract_domains", "args": {"text": "$raw_log"}},
-            {"tool": "extract_urls", "args": {"text": "$raw_log"}},
-            {"tool": "detect_encoding", "args": {"text": "$raw_log"}},
-            {"tool": "detect_data_exfil", "args": {"siem_event": "$siem_event"}},
-            {"tool": "score_exfiltration", "args": {"bytes_transferred": "$siem_event.bytes_transferred", "is_external_dest": true, "is_off_hours": false, "is_encrypted": false}},
-            {"tool": "correlate_with_history", "args": {"ioc_values": "$step1", "lookback_hours": 48, "history_context": "$correlation_context"}},
-            {"tool": "map_mitre", "args": {"technique_ids": ["T1041", "T1048", "T1567"]}}
-        ]
-    },
-    "privilege_escalation_hunt": {
-        "description": "Hunt for privilege escalation by parsing auth/Windows events, extracting usernames, and detecting sudo/UAC/token manipulation, COM hijacking, AppCert DLLs, and RunAs abuse",
-        "plan": [
-            {"tool": "parse_auth_log", "args": {"raw_log": "$raw_log"}},
-            {"tool": "extract_usernames", "args": {"text": "$raw_log"}},
-            {"tool": "extract_ipv4", "args": {"text": "$raw_log"}},
-            {"tool": "count_pattern", "args": {"text": "$raw_log", "pattern": "(?i)sudo|su\\s|UAC|privilege|escalat|suid|setuid|token|impersonat|SeDebugPrivilege"}},
-            {"tool": "detect_com_hijacking", "args": {"siem_event": "$siem_event"}},
-            {"tool": "detect_token_impersonation", "args": {"siem_event": "$siem_event"}},
-            {"tool": "detect_appcert_dlls", "args": {"siem_event": "$siem_event"}},
-            {"tool": "score_generic", "args": {"indicators_found": "$step4", "high_severity_count": 0, "medium_severity_count": "$step4"}},
-            {"tool": "correlate_with_history", "args": {"ioc_values": "$step2", "lookback_hours": 48, "history_context": "$correlation_context"}},
-            {"tool": "map_mitre", "args": {"technique_ids": ["T1548", "T1068", "T1134", "T1078", "T1546.015", "T1546.009", "T1134.001"]}}
-        ]
-    },
-    "c2_communication_hunt": {
-        "description": "Hunt for C2 communications by analyzing beacon intervals, domain entropy, DNS patterns, and known-bad infrastructure",
-        "plan": [
-            {"tool": "extract_ipv4", "args": {"text": "$raw_log"}},
-            {"tool": "extract_domains", "args": {"text": "$raw_log"}},
-            {"tool": "calculate_entropy", "args": {"text": "$siem_event.domain"}},
-            {"tool": "detect_c2", "args": {"siem_event": "$siem_event"}},
-            {"tool": "score_c2_beacon", "args": {"interval_stddev": "$step4.interval_stddev", "avg_interval_seconds": "$step4.avg_interval_seconds", "connection_count": "$step1.count", "domain_entropy": "$step3"}},
-            {"tool": "lookup_known_bad", "args": {"value": "$siem_event.source_ip", "ioc_type": "ip"}},
-            {"tool": "correlate_with_history", "args": {"ioc_values": "$step1", "lookback_hours": 168, "history_context": "$correlation_context"}},
-            {"tool": "map_mitre", "args": {"technique_ids": ["T1071", "T1095", "T1573", "T1105"]}}
-        ]
-    },
-    "lateral_movement_detection": {
-        "description": "Detect lateral movement via PsExec, WMI, WinRM, pass-the-hash, and admin share access patterns",
-        "plan": [
-            {"tool": "parse_windows_event", "args": {"raw_log": "$raw_log"}},
-            {"tool": "extract_ipv4", "args": {"text": "$raw_log"}},
-            {"tool": "extract_usernames", "args": {"text": "$raw_log"}},
-            {"tool": "count_pattern", "args": {"text": "$raw_log", "pattern": "(?i)psexec|wmi|winrm|admin\\$|ipc\\$|c\\$|pass.the.hash|ntlm|lateral|remote"}},
-            {"tool": "detect_encoded_service", "args": {"siem_event": "$siem_event"}},
-            {
-                "condition": "$step4 > 0",
-                "if_true": {"tool": "score_lateral_movement", "args": {"method": "psexec", "is_admin_share": true, "is_remote_exec": true, "uses_pass_the_hash": true}},
-                "if_false": {"tool": "score_lateral_movement", "args": {"method": "unknown", "is_admin_share": false, "is_remote_exec": false, "uses_pass_the_hash": false}}
-            },
-            {"tool": "correlate_with_history", "args": {"ioc_values": "$step2", "lookback_hours": 48, "history_context": "$correlation_context"}},
-            {"tool": "map_mitre", "args": {"technique_ids": ["T1021", "T1021.002", "T1021.006", "T1550.002", "T1543.003"]}}
-        ]
-    },
-    "insider_threat_detection": {
-        "description": "Detect insider threats by analyzing off-hours access, bulk data access, data staging patterns, and user behavioral anomalies",
-        "plan": [
-            {"tool": "extract_usernames", "args": {"text": "$raw_log"}},
-            {"tool": "extract_ipv4", "args": {"text": "$raw_log"}},
-            {"tool": "extract_emails", "args": {"text": "$raw_log"}},
-            {"tool": "count_pattern", "args": {"text": "$raw_log", "pattern": "(?i)download|copy|transfer|export|bulk|staging|archive|zip|tar|compress"}},
-            {"tool": "detect_data_exfil", "args": {"siem_event": "$siem_event"}},
-            {"tool": "score_exfiltration", "args": {"bytes_transferred": "$siem_event.bytes_transferred", "is_external_dest": false, "is_off_hours": false, "is_encrypted": false}},
-            {"tool": "correlate_with_history", "args": {"ioc_values": "$step1", "lookback_hours": 72, "history_context": "$correlation_context"}},
-            {"tool": "lookup_institutional_knowledge", "args": {"entities": "$step1", "knowledge_base": "$institutional_knowledge"}},
-            {"tool": "map_mitre", "args": {"technique_ids": ["T1074", "T1114", "T1530", "T1567"]}}
-        ]
-    },
-    "network_beaconing": {
-        "description": "Detect network beaconing by analyzing connection timing patterns, DNS anomalies, domain entropy, and C2 indicators",
-        "plan": [
-            {"tool": "extract_ipv4", "args": {"text": "$raw_log"}},
-            {"tool": "extract_domains", "args": {"text": "$raw_log"}},
-            {"tool": "parse_dns_query", "args": {"raw_log": "$raw_log"}},
-            {"tool": "calculate_entropy", "args": {"text": "$siem_event.domain"}},
-            {"tool": "detect_c2", "args": {"siem_event": "$siem_event"}},
-            {"tool": "score_c2_beacon", "args": {"interval_stddev": "$step5.interval_stddev", "avg_interval_seconds": "$step5.avg_interval_seconds", "connection_count": "$step1.count", "domain_entropy": "$step4"}},
-            {"tool": "correlate_with_history", "args": {"ioc_values": "$step1", "lookback_hours": 168, "history_context": "$correlation_context"}},
-            {"tool": "map_mitre", "args": {"technique_ids": ["T1071.001", "T1071.004", "T1573"]}}
-        ]
-    },
-    "cloud_infrastructure_attack": {
-        "description": "Investigate cloud infrastructure attacks including IAM changes, CloudTrail tampering, resource spikes, and unauthorized API calls",
-        "plan": [
-            {"tool": "extract_ipv4", "args": {"text": "$raw_log"}},
-            {"tool": "extract_usernames", "args": {"text": "$raw_log"}},
-            {"tool": "extract_emails", "args": {"text": "$raw_log"}},
-            {"tool": "count_pattern", "args": {"text": "$raw_log", "pattern": "(?i)iam|cloudtrail|CreateUser|AttachPolicy|PutBucketPolicy|AssumeRole|ConsoleLogin|StopLogging|DeleteTrail"}},
-            {"tool": "score_generic", "args": {"indicators_found": "$step4", "high_severity_count": 0, "medium_severity_count": "$step4"}},
-            {"tool": "lookup_known_bad", "args": {"value": "$siem_event.source_ip", "ioc_type": "ip"}},
-            {"tool": "correlate_with_history", "args": {"ioc_values": "$step1", "lookback_hours": 72, "history_context": "$correlation_context"}},
-            {"tool": "map_mitre", "args": {"technique_ids": ["T1078.004", "T1098", "T1562.008", "T1537"]}}
-        ]
-    },
-    "supply_chain_compromise": {
-        "description": "Investigate supply chain compromises by detecting hash mismatches, typosquatted packages, CI/CD modifications, and malicious dependency injection",
-        "plan": [
-            {"tool": "extract_hashes", "args": {"text": "$raw_log"}},
-            {"tool": "extract_domains", "args": {"text": "$raw_log"}},
-            {"tool": "extract_urls", "args": {"text": "$raw_log"}},
-            {"tool": "count_pattern", "args": {"text": "$raw_log", "pattern": "(?i)npm|pip|gem|nuget|maven|package|install|dependency|typosquat|hash.mismatch|checksum|CI|pipeline|build"}},
-            {"tool": "lookup_known_bad", "args": {"value": "$siem_event.source_ip", "ioc_type": "ip"}},
-            {"tool": "score_generic", "args": {"indicators_found": "$step4", "high_severity_count": 0, "medium_severity_count": "$step4"}},
-            {"tool": "correlate_with_history", "args": {"ioc_values": "$step1", "lookback_hours": 168, "history_context": "$correlation_context"}},
-            {"tool": "map_mitre", "args": {"technique_ids": ["T1195", "T1195.001", "T1195.002"]}}
-        ]
-    },
-    "kerberoasting": {
-        "description": "Detect Kerberoasting by identifying RC4 TGS requests, SPN enumeration, and anomalous service ticket patterns",
-        "plan": [
-            {"tool": "parse_windows_event", "args": {"raw_log": "$raw_log"}},
-            {"tool": "extract_usernames", "args": {"text": "$raw_log"}},
-            {"tool": "extract_ipv4", "args": {"text": "$raw_log"}},
-            {"tool": "detect_kerberoasting", "args": {"siem_event": "$siem_event"}},
-            {"tool": "count_pattern", "args": {"text": "$raw_log", "pattern": "(?i)0x17|RC4|TGS|kerberos|spn|service.ticket|4769"}},
-            {"tool": "correlate_with_history", "args": {"ioc_values": "$step2", "lookback_hours": 48, "history_context": "$correlation_context"}},
-            {"tool": "map_mitre", "args": {"technique_ids": ["T1558.003"]}}
-        ]
-    },
-    "golden_ticket": {
-        "description": "Detect Golden Ticket attacks by identifying forged TGTs, abnormal ticket lifetimes, and RC4 encryption in Kerberos events",
-        "plan": [
-            {"tool": "parse_windows_event", "args": {"raw_log": "$raw_log"}},
-            {"tool": "extract_usernames", "args": {"text": "$raw_log"}},
-            {"tool": "extract_ipv4", "args": {"text": "$raw_log"}},
-            {"tool": "detect_golden_ticket", "args": {"siem_event": "$siem_event"}},
-            {"tool": "count_pattern", "args": {"text": "$raw_log", "pattern": "(?i)golden.ticket|forged|TGT|krbtgt|abnormal.lifetime|4768|4769|RC4"}},
-            {"tool": "correlate_with_history", "args": {"ioc_values": "$step2", "lookback_hours": 72, "history_context": "$correlation_context"}},
-            {"tool": "map_mitre", "args": {"technique_ids": ["T1558.001"]}}
-        ]
-    },
-    "dcsync": {
-        "description": "Detect DCSync attacks by identifying directory replication requests from non-domain-controller hosts",
-        "plan": [
-            {"tool": "parse_windows_event", "args": {"raw_log": "$raw_log"}},
-            {"tool": "extract_ipv4", "args": {"text": "$raw_log"}},
-            {"tool": "extract_usernames", "args": {"text": "$raw_log"}},
-            {"tool": "count_pattern", "args": {"text": "$raw_log", "pattern": "(?i)DRSGetNCChanges|replication|DCSync|4662|1131|DS-Replication|mimikatz|lsadump"}},
-            {"tool": "score_generic", "args": {"indicators_found": "$step4", "high_severity_count": 0, "medium_severity_count": "$step4"}},
-            {"tool": "correlate_with_history", "args": {"ioc_values": "$step2", "lookback_hours": 48, "history_context": "$correlation_context"}},
-            {"tool": "map_mitre", "args": {"technique_ids": ["T1003.006"]}}
-        ]
-    },
-    "dll_sideloading": {
-        "description": "Detect DLL sideloading by identifying unsigned DLLs in suspicious paths, process anomalies, and known sideloading targets",
-        "plan": [
-            {"tool": "parse_windows_event", "args": {"raw_log": "$raw_log"}},
-            {"tool": "extract_hashes", "args": {"text": "$raw_log"}},
-            {"tool": "extract_ipv4", "args": {"text": "$raw_log"}},
-            {"tool": "count_pattern", "args": {"text": "$raw_log", "pattern": "(?i)sideload|unsigned|dll|loadlibrary|appdata|temp|programdata|writable"}},
-            {"tool": "lookup_known_bad", "args": {"value": "$siem_event.source_ip", "ioc_type": "ip"}},
-            {"tool": "score_generic", "args": {"indicators_found": "$step4", "high_severity_count": 0, "medium_severity_count": "$step4"}},
-            {"tool": "correlate_with_history", "args": {"ioc_values": "$step2", "lookback_hours": 72, "history_context": "$correlation_context"}},
-            {"tool": "map_mitre", "args": {"technique_ids": ["T1574.002"]}}
-        ]
-    },
-    "lolbin_abuse": {
-        "description": "Detect living-off-the-land binary abuse including certutil, mshta, bitsadmin, rundll32, and regsvr32 misuse",
-        "plan": [
-            {"tool": "parse_windows_event", "args": {"raw_log": "$raw_log"}},
-            {"tool": "extract_ipv4", "args": {"text": "$raw_log"}},
-            {"tool": "extract_urls", "args": {"text": "$raw_log"}},
-            {"tool": "detect_lolbin_abuse", "args": {"siem_event": "$siem_event"}},
-            {"tool": "count_pattern", "args": {"text": "$raw_log", "pattern": "(?i)certutil|mshta|bitsadmin|rundll32|regsvr32|cmstp|msiexec|wscript|cscript|forfiles|pcalua"}},
-            {"tool": "score_generic", "args": {"indicators_found": "$step5", "high_severity_count": 0, "medium_severity_count": "$step5"}},
-            {"tool": "correlate_with_history", "args": {"ioc_values": "$step2", "lookback_hours": 48, "history_context": "$correlation_context"}},
-            {"tool": "map_mitre", "args": {"technique_ids": ["T1218", "T1218.001", "T1218.005", "T1218.010", "T1218.011"]}}
-        ]
-    },
-    "process_injection": {
-        "description": "Detect process injection by identifying CreateRemoteThread, lsass targeting, memory manipulation, and code injection patterns",
-        "plan": [
-            {"tool": "parse_windows_event", "args": {"raw_log": "$raw_log"}},
-            {"tool": "extract_ipv4", "args": {"text": "$raw_log"}},
-            {"tool": "extract_hashes", "args": {"text": "$raw_log"}},
-            {"tool": "count_pattern", "args": {"text": "$raw_log", "pattern": "(?i)CreateRemoteThread|NtWriteVirtualMemory|VirtualAllocEx|lsass|inject|hollowing|QueueUserAPC|SetThreadContext"}},
-            {"tool": "score_generic", "args": {"indicators_found": "$step4", "high_severity_count": 0, "medium_severity_count": "$step4"}},
-            {"tool": "lookup_known_bad", "args": {"value": "$siem_event.source_ip", "ioc_type": "ip"}},
-            {"tool": "correlate_with_history", "args": {"ioc_values": "$step2", "lookback_hours": 48, "history_context": "$correlation_context"}},
-            {"tool": "map_mitre", "args": {"technique_ids": ["T1055", "T1055.001", "T1055.012"]}}
-        ]
-    },
-    "wmi_lateral": {
-        "description": "Detect WMI-based lateral movement by identifying remote WMI process creation, Win32_Process calls, and DCOM connections",
-        "plan": [
-            {"tool": "parse_windows_event", "args": {"raw_log": "$raw_log"}},
-            {"tool": "extract_ipv4", "args": {"text": "$raw_log"}},
-            {"tool": "extract_usernames", "args": {"text": "$raw_log"}},
-            {"tool": "count_pattern", "args": {"text": "$raw_log", "pattern": "(?i)wmi|Win32_Process|wmiprvse|wmic|process.call.create|DCOM|5857|5858|5861"}},
-            {"tool": "score_lateral_movement", "args": {"method": "wmi", "is_admin_share": false, "is_remote_exec": true, "uses_pass_the_hash": false}},
-            {"tool": "correlate_with_history", "args": {"ioc_values": "$step2", "lookback_hours": 48, "history_context": "$correlation_context"}},
-            {"tool": "map_mitre", "args": {"technique_ids": ["T1047", "T1021.003"]}}
-        ]
-    },
-    "rdp_tunneling": {
-        "description": "Detect RDP tunneling by identifying SSH tunnels, unusual RDP ports, plink/putty usage, and reverse tunnel indicators",
-        "plan": [
-            {"tool": "extract_ipv4", "args": {"text": "$raw_log"}},
-            {"tool": "extract_usernames", "args": {"text": "$raw_log"}},
-            {"tool": "parse_auth_log", "args": {"raw_log": "$raw_log"}},
-            {"tool": "count_pattern", "args": {"text": "$raw_log", "pattern": "(?i)tunnel|plink|putty|ssh.*-L|ssh.*-R|rdp|3389|mstsc|reverse.forward|port.forward|netsh"}},
-            {"tool": "score_generic", "args": {"indicators_found": "$step4", "high_severity_count": 0, "medium_severity_count": "$step4"}},
-            {"tool": "lookup_known_bad", "args": {"value": "$siem_event.source_ip", "ioc_type": "ip"}},
-            {"tool": "correlate_with_history", "args": {"ioc_values": "$step1", "lookback_hours": 72, "history_context": "$correlation_context"}},
-            {"tool": "map_mitre", "args": {"technique_ids": ["T1021.001", "T1572"]}}
-        ]
-    },
-    "dns_exfiltration": {
-        "description": "Detect DNS exfiltration by analyzing high-entropy DNS queries, TXT record abuse, and anomalous query patterns",
-        "plan": [
-            {"tool": "parse_dns_query", "args": {"raw_log": "$raw_log"}},
-            {"tool": "extract_domains", "args": {"text": "$raw_log"}},
-            {"tool": "extract_ipv4", "args": {"text": "$raw_log"}},
-            {"tool": "detect_dns_exfiltration", "args": {"siem_event": "$siem_event"}},
-            {"tool": "count_pattern", "args": {"text": "$raw_log", "pattern": "(?i)TXT|dns|query|subdomain|nslookup|dig|high.entropy|tunnel"}},
-            {"tool": "correlate_with_history", "args": {"ioc_values": "$step2", "lookback_hours": 168, "history_context": "$correlation_context"}},
-            {"tool": "map_mitre", "args": {"technique_ids": ["T1048.003", "T1071.004"]}}
-        ]
-    },
-    "powershell_obfuscation": {
-        "description": "Detect obfuscated PowerShell execution including encoded commands, IEX cradles, download cradles, and AMSI bypass attempts",
-        "plan": [
-            {"tool": "parse_windows_event", "args": {"raw_log": "$raw_log"}},
-            {"tool": "check_base64", "args": {"text": "$raw_log"}},
-            {"tool": "detect_encoding", "args": {"text": "$raw_log"}},
-            {"tool": "count_pattern", "args": {"text": "$raw_log", "pattern": "(?i)-enc|-encodedcommand|IEX|Invoke-Expression|Net\\.WebClient|DownloadString|FromBase64|bypass|amsi|ScriptBlock"}},
-            {"tool": "detect_lolbin_abuse", "args": {"siem_event": "$siem_event"}},
-            {"tool": "score_generic", "args": {"indicators_found": "$step4", "high_severity_count": 0, "medium_severity_count": "$step4"}},
-            {"tool": "correlate_with_history", "args": {"ioc_values": "$step2", "lookback_hours": 48, "history_context": "$correlation_context"}},
-            {"tool": "map_mitre", "args": {"technique_ids": ["T1059.001", "T1027", "T1140"]}}
-        ]
-    },
-    "credential_access": {
-        "description": "Investigate general credential access attempts including credential dumping, keylogging, brute force, and credential store access",
-        "plan": [
-            {"tool": "parse_auth_log", "args": {"raw_log": "$raw_log"}},
-            {"tool": "extract_usernames", "args": {"text": "$raw_log"}},
-            {"tool": "extract_ipv4", "args": {"text": "$raw_log"}},
-            {"tool": "extract_hashes", "args": {"text": "$raw_log"}},
-            {"tool": "count_pattern", "args": {"text": "$raw_log", "pattern": "(?i)credential|password|lsass|mimikatz|procdump|SAM|NTDS|vault|keylog|dpapi|sekurlsa|hashdump"}},
-            {"tool": "score_generic", "args": {"indicators_found": "$step5", "high_severity_count": 0, "medium_severity_count": "$step5"}},
-            {"tool": "correlate_with_history", "args": {"ioc_values": "$step3", "lookback_hours": 72, "history_context": "$correlation_context"}},
-            {"tool": "map_mitre", "args": {"technique_ids": ["T1003", "T1003.001", "T1110", "T1555"]}}
-        ]
-    },
-    "api_key_abuse": {
-        "description": "Investigate API key abuse by detecting unauthorized API usage from external IPs, anomalous call patterns, and key exposure indicators",
-        "plan": [
-            {"tool": "extract_ipv4", "args": {"text": "$raw_log"}},
-            {"tool": "extract_emails", "args": {"text": "$raw_log"}},
-            {"tool": "parse_http_request", "args": {"raw_log": "$raw_log"}},
-            {"tool": "count_pattern", "args": {"text": "$raw_log", "pattern": "(?i)api.key|token|bearer|authorization|unauthorized|403|401|rate.limit|key.exposed|secret"}},
-            {"tool": "lookup_known_bad", "args": {"value": "$siem_event.source_ip", "ioc_type": "ip"}},
-            {"tool": "score_generic", "args": {"indicators_found": "$step4", "high_severity_count": 0, "medium_severity_count": "$step4"}},
-            {"tool": "correlate_with_history", "args": {"ioc_values": "$step1", "lookback_hours": 48, "history_context": "$correlation_context"}},
-            {"tool": "map_mitre", "args": {"technique_ids": ["T1552.004", "T1528"]}}
-        ]
-    },
-    "benign_system_event": {
-        "description": "Minimal investigation for benign system events -- extract IPs for record-keeping and score with zero indicators",
-        "plan": [
-            {"tool": "extract_ipv4", "args": {"text": "$raw_log"}},
-            {"tool": "score_generic", "args": {"indicators_found": 0, "high_severity_count": 0, "medium_severity_count": 0}}
-        ]
-    }
+  "brute_force": {
+    "description": "Investigate brute force / credential stuffing attacks by counting failed auth attempts, extracting source IPs, and scoring based on volume and source diversity",
+    "plan": [
+      {
+        "tool": "parse_auth_log",
+        "args": {
+          "raw_log": "$raw_log"
+        }
+      },
+      {
+        "tool": "extract_ipv4",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "extract_usernames",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "count_pattern",
+        "args": {
+          "text": "$raw_log",
+          "pattern": "(?i)fail|denied|invalid|error|rejected"
+        }
+      },
+      {
+        "condition": "$step4 > 50",
+        "if_true": {
+          "tool": "score_brute_force",
+          "args": {
+            "failed_count": "$step4",
+            "unique_sources": "$step2.count",
+            "timespan_minutes": 60
+          }
+        },
+        "if_false": {
+          "tool": "score_brute_force",
+          "args": {
+            "failed_count": "$step4",
+            "unique_sources": "$step2.count",
+            "timespan_minutes": 120
+          }
+        }
+      },
+      {
+        "tool": "correlate_with_history",
+        "args": {
+          "ioc_values": "$step2",
+          "lookback_hours": 72,
+          "history_context": "$correlation_context"
+        }
+      },
+      {
+        "tool": "map_mitre",
+        "args": {
+          "technique_ids": [
+            "T1110",
+            "T1110.001",
+            "T1110.003"
+          ]
+        }
+      }
+    ]
+  },
+  "phishing_investigation": {
+    "description": "Investigate phishing attempts by extracting URLs, domains, and email addresses, detecting credential harvesting, and scoring phishing indicators",
+    "plan": [
+      {
+        "tool": "extract_urls",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "extract_domains",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "extract_emails",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "detect_phishing",
+        "args": {
+          "siem_event": "$siem_event"
+        }
+      },
+      {
+        "tool": "count_pattern",
+        "args": {
+          "text": "$raw_log",
+          "pattern": "(?i)urgent|immediate|verify.*account|suspend|expire|click\\s+here|act\\s+now"
+        }
+      },
+      {
+        "tool": "count_pattern",
+        "args": {
+          "text": "$raw_log",
+          "pattern": "(?i)login|password|credential|verify|secure.*login"
+        }
+      },
+      {
+        "condition": "$step6 > 0",
+        "if_true": {
+          "tool": "score_phishing",
+          "args": {
+            "url_count": "$step1.count",
+            "suspicious_domains": "$step2.count",
+            "has_credential_form": true,
+            "has_urgency_language": true
+          }
+        },
+        "if_false": {
+          "tool": "score_phishing",
+          "args": {
+            "url_count": "$step1.count",
+            "suspicious_domains": "$step2.count",
+            "has_credential_form": false,
+            "has_urgency_language": false
+          }
+        }
+      },
+      {
+        "tool": "lookup_known_bad",
+        "args": {
+          "value": "$siem_event.source_ip",
+          "ioc_type": "ip"
+        }
+      },
+      {
+        "tool": "correlate_with_history",
+        "args": {
+          "ioc_values": "$step2",
+          "lookback_hours": 168,
+          "history_context": "$correlation_context"
+        }
+      },
+      {
+        "tool": "map_mitre",
+        "args": {
+          "technique_ids": [
+            "T1566",
+            "T1566.001",
+            "T1566.002"
+          ]
+        }
+      }
+    ]
+  },
+  "ransomware_triage": {
+    "description": "Triage ransomware incidents by detecting shadow copy deletion, mass encryption patterns, and extracting IOCs from process execution logs",
+    "plan": [
+      {
+        "tool": "parse_windows_event",
+        "args": {
+          "raw_log": "$raw_log"
+        }
+      },
+      {
+        "tool": "extract_ipv4",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "extract_hashes",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "detect_ransomware",
+        "args": {
+          "siem_event": "$siem_event"
+        }
+      },
+      {
+        "tool": "count_pattern",
+        "args": {
+          "text": "$raw_log",
+          "pattern": "(?i)vssadmin|shadow|encrypt|ransom|bcdedit|wbadmin|delete|cipher"
+        }
+      },
+      {
+        "tool": "lookup_known_bad",
+        "args": {
+          "value": "$siem_event.source_ip",
+          "ioc_type": "ip"
+        }
+      },
+      {
+        "tool": "correlate_with_history",
+        "args": {
+          "ioc_values": "$step3",
+          "lookback_hours": 24,
+          "history_context": "$correlation_context"
+        }
+      },
+      {
+        "tool": "map_mitre",
+        "args": {
+          "technique_ids": [
+            "T1486",
+            "T1490",
+            "T1027"
+          ]
+        }
+      }
+    ]
+  },
+  "data_exfiltration_detection": {
+    "description": "Detect data exfiltration by analyzing transfer volumes, destination IPs, encoding patterns, and off-hours activity",
+    "plan": [
+      {
+        "tool": "extract_ipv4",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "extract_domains",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "extract_urls",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "detect_encoding",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "detect_data_exfil",
+        "args": {
+          "siem_event": "$siem_event"
+        }
+      },
+      {
+        "tool": "score_exfiltration",
+        "args": {
+          "bytes_transferred": "$siem_event.bytes_transferred",
+          "is_external_dest": true,
+          "is_off_hours": false,
+          "is_encrypted": false
+        }
+      },
+      {
+        "tool": "correlate_with_history",
+        "args": {
+          "ioc_values": "$step1",
+          "lookback_hours": 48,
+          "history_context": "$correlation_context"
+        }
+      },
+      {
+        "tool": "map_mitre",
+        "args": {
+          "technique_ids": [
+            "T1041",
+            "T1048",
+            "T1567"
+          ]
+        }
+      }
+    ]
+  },
+  "privilege_escalation_hunt": {
+    "description": "Hunt for privilege escalation by parsing auth/Windows events, extracting usernames, and detecting sudo/UAC/token manipulation, COM hijacking, AppCert DLLs, and RunAs abuse",
+    "plan": [
+      {
+        "tool": "parse_auth_log",
+        "args": {
+          "raw_log": "$raw_log"
+        }
+      },
+      {
+        "tool": "extract_usernames",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "extract_ipv4",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "count_pattern",
+        "args": {
+          "text": "$raw_log",
+          "pattern": "(?i)sudo|su\\s|UAC|privilege|escalat|suid|setuid|token|impersonat|SeDebugPrivilege"
+        }
+      },
+      {
+        "tool": "detect_com_hijacking",
+        "args": {
+          "siem_event": "$siem_event"
+        }
+      },
+      {
+        "tool": "detect_token_impersonation",
+        "args": {
+          "siem_event": "$siem_event"
+        }
+      },
+      {
+        "tool": "detect_appcert_dlls",
+        "args": {
+          "siem_event": "$siem_event"
+        }
+      },
+      {
+        "tool": "score_generic",
+        "args": {
+          "indicators_found": "$step4",
+          "high_severity_count": 0,
+          "medium_severity_count": "$step4"
+        }
+      },
+      {
+        "tool": "correlate_with_history",
+        "args": {
+          "ioc_values": "$step2",
+          "lookback_hours": 48,
+          "history_context": "$correlation_context"
+        }
+      },
+      {
+        "tool": "map_mitre",
+        "args": {
+          "technique_ids": [
+            "T1548",
+            "T1068",
+            "T1134",
+            "T1078",
+            "T1546.015",
+            "T1546.009",
+            "T1134.001"
+          ]
+        }
+      }
+    ]
+  },
+  "c2_communication_hunt": {
+    "description": "Hunt for C2 communications by analyzing beacon intervals, domain entropy, DNS patterns, and known-bad infrastructure",
+    "plan": [
+      {
+        "tool": "extract_ipv4",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "extract_domains",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "calculate_entropy",
+        "args": {
+          "text": "$siem_event.domain"
+        }
+      },
+      {
+        "tool": "detect_c2",
+        "args": {
+          "siem_event": "$siem_event"
+        }
+      },
+      {
+        "tool": "score_c2_beacon",
+        "args": {
+          "interval_stddev": "$step4.interval_stddev",
+          "avg_interval_seconds": "$step4.avg_interval_seconds",
+          "connection_count": "$step1.count",
+          "domain_entropy": "$step3"
+        }
+      },
+      {
+        "tool": "lookup_known_bad",
+        "args": {
+          "value": "$siem_event.source_ip",
+          "ioc_type": "ip"
+        }
+      },
+      {
+        "tool": "correlate_with_history",
+        "args": {
+          "ioc_values": "$step1",
+          "lookback_hours": 168,
+          "history_context": "$correlation_context"
+        }
+      },
+      {
+        "tool": "map_mitre",
+        "args": {
+          "technique_ids": [
+            "T1071",
+            "T1095",
+            "T1573",
+            "T1105"
+          ]
+        }
+      }
+    ]
+  },
+  "lateral_movement_detection": {
+    "description": "Detect lateral movement via PsExec, WMI, WinRM, pass-the-hash, and admin share access patterns",
+    "plan": [
+      {
+        "tool": "parse_windows_event",
+        "args": {
+          "raw_log": "$raw_log"
+        }
+      },
+      {
+        "tool": "extract_ipv4",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "extract_usernames",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "count_pattern",
+        "args": {
+          "text": "$raw_log",
+          "pattern": "(?i)psexec|wmi|winrm|admin\\$|ipc\\$|c\\$|pass.the.hash|ntlm|lateral|remote"
+        }
+      },
+      {
+        "tool": "detect_encoded_service",
+        "args": {
+          "siem_event": "$siem_event"
+        }
+      },
+      {
+        "condition": "$step4 > 0",
+        "if_true": {
+          "tool": "score_lateral_movement",
+          "args": {
+            "method": "psexec",
+            "is_admin_share": true,
+            "is_remote_exec": true,
+            "uses_pass_the_hash": true
+          }
+        },
+        "if_false": {
+          "tool": "score_lateral_movement",
+          "args": {
+            "method": "unknown",
+            "is_admin_share": false,
+            "is_remote_exec": false,
+            "uses_pass_the_hash": false
+          }
+        }
+      },
+      {
+        "tool": "correlate_with_history",
+        "args": {
+          "ioc_values": "$step2",
+          "lookback_hours": 48,
+          "history_context": "$correlation_context"
+        }
+      },
+      {
+        "tool": "map_mitre",
+        "args": {
+          "technique_ids": [
+            "T1021",
+            "T1021.002",
+            "T1021.006",
+            "T1550.002",
+            "T1543.003"
+          ]
+        }
+      }
+    ]
+  },
+  "insider_threat_detection": {
+    "description": "Detect insider threats by analyzing off-hours access, bulk data access, data staging patterns, and user behavioral anomalies",
+    "plan": [
+      {
+        "tool": "extract_usernames",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "extract_ipv4",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "extract_emails",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "count_pattern",
+        "args": {
+          "text": "$raw_log",
+          "pattern": "(?i)download|copy|transfer|export|bulk|staging|archive|zip|tar|compress"
+        }
+      },
+      {
+        "tool": "detect_data_exfil",
+        "args": {
+          "siem_event": "$siem_event"
+        }
+      },
+      {
+        "tool": "score_exfiltration",
+        "args": {
+          "bytes_transferred": "$siem_event.bytes_transferred",
+          "is_external_dest": false,
+          "is_off_hours": false,
+          "is_encrypted": false
+        }
+      },
+      {
+        "tool": "correlate_with_history",
+        "args": {
+          "ioc_values": "$step1",
+          "lookback_hours": 72,
+          "history_context": "$correlation_context"
+        }
+      },
+      {
+        "tool": "lookup_institutional_knowledge",
+        "args": {
+          "entities": "$step1",
+          "knowledge_base": "$institutional_knowledge"
+        }
+      },
+      {
+        "tool": "map_mitre",
+        "args": {
+          "technique_ids": [
+            "T1074",
+            "T1114",
+            "T1530",
+            "T1567"
+          ]
+        }
+      }
+    ]
+  },
+  "network_beaconing": {
+    "description": "Detect network beaconing by analyzing connection timing patterns, DNS anomalies, domain entropy, and C2 indicators",
+    "plan": [
+      {
+        "tool": "extract_ipv4",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "extract_domains",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "parse_dns_query",
+        "args": {
+          "raw_log": "$raw_log"
+        }
+      },
+      {
+        "tool": "calculate_entropy",
+        "args": {
+          "text": "$siem_event.domain"
+        }
+      },
+      {
+        "tool": "detect_c2",
+        "args": {
+          "siem_event": "$siem_event"
+        }
+      },
+      {
+        "tool": "score_c2_beacon",
+        "args": {
+          "interval_stddev": "$step5.interval_stddev",
+          "avg_interval_seconds": "$step5.avg_interval_seconds",
+          "connection_count": "$step1.count",
+          "domain_entropy": "$step4"
+        }
+      },
+      {
+        "tool": "correlate_with_history",
+        "args": {
+          "ioc_values": "$step1",
+          "lookback_hours": 168,
+          "history_context": "$correlation_context"
+        }
+      },
+      {
+        "tool": "map_mitre",
+        "args": {
+          "technique_ids": [
+            "T1071.001",
+            "T1071.004",
+            "T1573"
+          ]
+        }
+      }
+    ]
+  },
+  "cloud_infrastructure_attack": {
+    "description": "Investigate cloud infrastructure attacks including IAM changes, CloudTrail tampering, resource spikes, and unauthorized API calls",
+    "plan": [
+      {
+        "tool": "extract_ipv4",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "extract_usernames",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "extract_emails",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "count_pattern",
+        "args": {
+          "text": "$raw_log",
+          "pattern": "(?i)iam|cloudtrail|CreateUser|AttachPolicy|PutBucketPolicy|AssumeRole|ConsoleLogin|StopLogging|DeleteTrail"
+        }
+      },
+      {
+        "tool": "score_generic",
+        "args": {
+          "indicators_found": "$step4",
+          "high_severity_count": 0,
+          "medium_severity_count": "$step4"
+        }
+      },
+      {
+        "tool": "lookup_known_bad",
+        "args": {
+          "value": "$siem_event.source_ip",
+          "ioc_type": "ip"
+        }
+      },
+      {
+        "tool": "correlate_with_history",
+        "args": {
+          "ioc_values": "$step1",
+          "lookback_hours": 72,
+          "history_context": "$correlation_context"
+        }
+      },
+      {
+        "tool": "map_mitre",
+        "args": {
+          "technique_ids": [
+            "T1078.004",
+            "T1098",
+            "T1562.008",
+            "T1537"
+          ]
+        }
+      }
+    ]
+  },
+  "supply_chain_compromise": {
+    "description": "Investigate supply chain compromises by detecting hash mismatches, typosquatted packages, CI/CD modifications, and malicious dependency injection",
+    "plan": [
+      {
+        "tool": "extract_hashes",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "extract_domains",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "extract_urls",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "count_pattern",
+        "args": {
+          "text": "$raw_log",
+          "pattern": "(?i)npm|pip|gem|nuget|maven|package|install|dependency|typosquat|hash.mismatch|checksum|CI|pipeline|build"
+        }
+      },
+      {
+        "tool": "lookup_known_bad",
+        "args": {
+          "value": "$siem_event.source_ip",
+          "ioc_type": "ip"
+        }
+      },
+      {
+        "tool": "score_generic",
+        "args": {
+          "indicators_found": "$step4",
+          "high_severity_count": 0,
+          "medium_severity_count": "$step4"
+        }
+      },
+      {
+        "tool": "correlate_with_history",
+        "args": {
+          "ioc_values": "$step1",
+          "lookback_hours": 168,
+          "history_context": "$correlation_context"
+        }
+      },
+      {
+        "tool": "map_mitre",
+        "args": {
+          "technique_ids": [
+            "T1195",
+            "T1195.001",
+            "T1195.002"
+          ]
+        }
+      }
+    ]
+  },
+  "kerberoasting": {
+    "description": "Detect Kerberoasting by identifying RC4 TGS requests, SPN enumeration, and anomalous service ticket patterns",
+    "plan": [
+      {
+        "tool": "parse_windows_event",
+        "args": {
+          "raw_log": "$raw_log"
+        }
+      },
+      {
+        "tool": "extract_usernames",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "extract_ipv4",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "detect_kerberoasting",
+        "args": {
+          "siem_event": "$siem_event"
+        }
+      },
+      {
+        "tool": "count_pattern",
+        "args": {
+          "text": "$raw_log",
+          "pattern": "(?i)0x17|RC4|TGS|kerberos|spn|service.ticket|4769"
+        }
+      },
+      {
+        "tool": "correlate_with_history",
+        "args": {
+          "ioc_values": "$step2",
+          "lookback_hours": 48,
+          "history_context": "$correlation_context"
+        }
+      },
+      {
+        "tool": "map_mitre",
+        "args": {
+          "technique_ids": [
+            "T1558.003"
+          ]
+        }
+      }
+    ]
+  },
+  "golden_ticket": {
+    "description": "Detect Golden Ticket attacks by identifying forged TGTs, abnormal ticket lifetimes, and RC4 encryption in Kerberos events",
+    "plan": [
+      {
+        "tool": "parse_windows_event",
+        "args": {
+          "raw_log": "$raw_log"
+        }
+      },
+      {
+        "tool": "extract_usernames",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "extract_ipv4",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "detect_golden_ticket",
+        "args": {
+          "siem_event": "$siem_event"
+        }
+      },
+      {
+        "tool": "count_pattern",
+        "args": {
+          "text": "$raw_log",
+          "pattern": "(?i)golden.ticket|forged|TGT|krbtgt|abnormal.lifetime|4768|4769|RC4"
+        }
+      },
+      {
+        "tool": "correlate_with_history",
+        "args": {
+          "ioc_values": "$step2",
+          "lookback_hours": 72,
+          "history_context": "$correlation_context"
+        }
+      },
+      {
+        "tool": "map_mitre",
+        "args": {
+          "technique_ids": [
+            "T1558.001"
+          ]
+        }
+      }
+    ]
+  },
+  "dcsync": {
+    "description": "Detect DCSync attacks by identifying directory replication requests from non-domain-controller hosts",
+    "plan": [
+      {
+        "tool": "parse_windows_event",
+        "args": {
+          "raw_log": "$raw_log"
+        }
+      },
+      {
+        "tool": "extract_ipv4",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "extract_usernames",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "count_pattern",
+        "args": {
+          "text": "$raw_log",
+          "pattern": "(?i)DRSGetNCChanges|replication|DCSync|4662|1131|DS-Replication|mimikatz|lsadump"
+        }
+      },
+      {
+        "tool": "score_generic",
+        "args": {
+          "indicators_found": "$step4",
+          "high_severity_count": 0,
+          "medium_severity_count": "$step4"
+        }
+      },
+      {
+        "tool": "correlate_with_history",
+        "args": {
+          "ioc_values": "$step2",
+          "lookback_hours": 48,
+          "history_context": "$correlation_context"
+        }
+      },
+      {
+        "tool": "map_mitre",
+        "args": {
+          "technique_ids": [
+            "T1003.006"
+          ]
+        }
+      }
+    ]
+  },
+  "dll_sideloading": {
+    "description": "Detect DLL sideloading by identifying unsigned DLLs in suspicious paths, process anomalies, and known sideloading targets",
+    "plan": [
+      {
+        "tool": "parse_windows_event",
+        "args": {
+          "raw_log": "$raw_log"
+        }
+      },
+      {
+        "tool": "extract_hashes",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "extract_ipv4",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "count_pattern",
+        "args": {
+          "text": "$raw_log",
+          "pattern": "(?i)sideload|unsigned|dll|loadlibrary|appdata|temp|programdata|writable"
+        }
+      },
+      {
+        "tool": "lookup_known_bad",
+        "args": {
+          "value": "$siem_event.source_ip",
+          "ioc_type": "ip"
+        }
+      },
+      {
+        "tool": "score_generic",
+        "args": {
+          "indicators_found": "$step4",
+          "high_severity_count": 0,
+          "medium_severity_count": "$step4"
+        }
+      },
+      {
+        "tool": "correlate_with_history",
+        "args": {
+          "ioc_values": "$step2",
+          "lookback_hours": 72,
+          "history_context": "$correlation_context"
+        }
+      },
+      {
+        "tool": "map_mitre",
+        "args": {
+          "technique_ids": [
+            "T1574.002"
+          ]
+        }
+      }
+    ]
+  },
+  "lolbin_abuse": {
+    "description": "Detect living-off-the-land binary abuse including certutil, mshta, bitsadmin, rundll32, and regsvr32 misuse",
+    "plan": [
+      {
+        "tool": "parse_windows_event",
+        "args": {
+          "raw_log": "$raw_log"
+        }
+      },
+      {
+        "tool": "extract_ipv4",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "extract_urls",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "detect_lolbin_abuse",
+        "args": {
+          "siem_event": "$siem_event"
+        }
+      },
+      {
+        "tool": "count_pattern",
+        "args": {
+          "text": "$raw_log",
+          "pattern": "(?i)certutil|mshta|bitsadmin|rundll32|regsvr32|cmstp|msiexec|wscript|cscript|forfiles|pcalua"
+        }
+      },
+      {
+        "tool": "score_generic",
+        "args": {
+          "indicators_found": "$step5",
+          "high_severity_count": 0,
+          "medium_severity_count": "$step5"
+        }
+      },
+      {
+        "tool": "correlate_with_history",
+        "args": {
+          "ioc_values": "$step2",
+          "lookback_hours": 48,
+          "history_context": "$correlation_context"
+        }
+      },
+      {
+        "tool": "map_mitre",
+        "args": {
+          "technique_ids": [
+            "T1218",
+            "T1218.001",
+            "T1218.005",
+            "T1218.010",
+            "T1218.011"
+          ]
+        }
+      }
+    ]
+  },
+  "process_injection": {
+    "description": "Detect process injection by identifying CreateRemoteThread, lsass targeting, memory manipulation, and code injection patterns",
+    "plan": [
+      {
+        "tool": "parse_windows_event",
+        "args": {
+          "raw_log": "$raw_log"
+        }
+      },
+      {
+        "tool": "extract_ipv4",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "extract_hashes",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "count_pattern",
+        "args": {
+          "text": "$raw_log",
+          "pattern": "(?i)CreateRemoteThread|NtWriteVirtualMemory|VirtualAllocEx|lsass|inject|hollowing|QueueUserAPC|SetThreadContext"
+        }
+      },
+      {
+        "tool": "score_generic",
+        "args": {
+          "indicators_found": "$step4",
+          "high_severity_count": 0,
+          "medium_severity_count": "$step4"
+        }
+      },
+      {
+        "tool": "lookup_known_bad",
+        "args": {
+          "value": "$siem_event.source_ip",
+          "ioc_type": "ip"
+        }
+      },
+      {
+        "tool": "correlate_with_history",
+        "args": {
+          "ioc_values": "$step2",
+          "lookback_hours": 48,
+          "history_context": "$correlation_context"
+        }
+      },
+      {
+        "tool": "map_mitre",
+        "args": {
+          "technique_ids": [
+            "T1055",
+            "T1055.001",
+            "T1055.012"
+          ]
+        }
+      }
+    ]
+  },
+  "wmi_lateral": {
+    "description": "Detect WMI-based lateral movement by identifying remote WMI process creation, Win32_Process calls, and DCOM connections",
+    "plan": [
+      {
+        "tool": "parse_windows_event",
+        "args": {
+          "raw_log": "$raw_log"
+        }
+      },
+      {
+        "tool": "extract_ipv4",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "extract_usernames",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "count_pattern",
+        "args": {
+          "text": "$raw_log",
+          "pattern": "(?i)wmi|Win32_Process|wmiprvse|wmic|process.call.create|DCOM|5857|5858|5861"
+        }
+      },
+      {
+        "tool": "score_lateral_movement",
+        "args": {
+          "method": "wmi",
+          "is_admin_share": false,
+          "is_remote_exec": true,
+          "uses_pass_the_hash": false
+        }
+      },
+      {
+        "tool": "correlate_with_history",
+        "args": {
+          "ioc_values": "$step2",
+          "lookback_hours": 48,
+          "history_context": "$correlation_context"
+        }
+      },
+      {
+        "tool": "map_mitre",
+        "args": {
+          "technique_ids": [
+            "T1047",
+            "T1021.003"
+          ]
+        }
+      }
+    ]
+  },
+  "rdp_tunneling": {
+    "description": "Detect RDP tunneling by identifying SSH tunnels, unusual RDP ports, plink/putty usage, and reverse tunnel indicators",
+    "plan": [
+      {
+        "tool": "extract_ipv4",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "extract_usernames",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "parse_auth_log",
+        "args": {
+          "raw_log": "$raw_log"
+        }
+      },
+      {
+        "tool": "count_pattern",
+        "args": {
+          "text": "$raw_log",
+          "pattern": "(?i)tunnel|plink|putty|ssh.*-L|ssh.*-R|rdp|3389|mstsc|reverse.forward|port.forward|netsh"
+        }
+      },
+      {
+        "tool": "score_generic",
+        "args": {
+          "indicators_found": "$step4",
+          "high_severity_count": 0,
+          "medium_severity_count": "$step4"
+        }
+      },
+      {
+        "tool": "lookup_known_bad",
+        "args": {
+          "value": "$siem_event.source_ip",
+          "ioc_type": "ip"
+        }
+      },
+      {
+        "tool": "correlate_with_history",
+        "args": {
+          "ioc_values": "$step1",
+          "lookback_hours": 72,
+          "history_context": "$correlation_context"
+        }
+      },
+      {
+        "tool": "map_mitre",
+        "args": {
+          "technique_ids": [
+            "T1021.001",
+            "T1572"
+          ]
+        }
+      }
+    ]
+  },
+  "dns_exfiltration": {
+    "description": "Detect DNS exfiltration by analyzing high-entropy DNS queries, TXT record abuse, and anomalous query patterns",
+    "plan": [
+      {
+        "tool": "parse_dns_query",
+        "args": {
+          "raw_log": "$raw_log"
+        }
+      },
+      {
+        "tool": "extract_domains",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "extract_ipv4",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "detect_dns_exfiltration",
+        "args": {
+          "siem_event": "$siem_event"
+        }
+      },
+      {
+        "tool": "count_pattern",
+        "args": {
+          "text": "$raw_log",
+          "pattern": "(?i)TXT|dns|query|subdomain|nslookup|dig|high.entropy|tunnel"
+        }
+      },
+      {
+        "tool": "correlate_with_history",
+        "args": {
+          "ioc_values": "$step2",
+          "lookback_hours": 168,
+          "history_context": "$correlation_context"
+        }
+      },
+      {
+        "tool": "map_mitre",
+        "args": {
+          "technique_ids": [
+            "T1048.003",
+            "T1071.004"
+          ]
+        }
+      }
+    ]
+  },
+  "powershell_obfuscation": {
+    "description": "Detect obfuscated PowerShell execution including encoded commands, IEX cradles, download cradles, and AMSI bypass attempts",
+    "plan": [
+      {
+        "tool": "parse_windows_event",
+        "args": {
+          "raw_log": "$raw_log"
+        }
+      },
+      {
+        "tool": "check_base64",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "detect_encoding",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "count_pattern",
+        "args": {
+          "text": "$raw_log",
+          "pattern": "(?i)-enc|-encodedcommand|IEX|Invoke-Expression|Net\\.WebClient|DownloadString|FromBase64|bypass|amsi|ScriptBlock"
+        }
+      },
+      {
+        "tool": "detect_lolbin_abuse",
+        "args": {
+          "siem_event": "$siem_event"
+        }
+      },
+      {
+        "tool": "score_generic",
+        "args": {
+          "indicators_found": "$step4",
+          "high_severity_count": 0,
+          "medium_severity_count": "$step4"
+        }
+      },
+      {
+        "tool": "correlate_with_history",
+        "args": {
+          "ioc_values": "$step2",
+          "lookback_hours": 48,
+          "history_context": "$correlation_context"
+        }
+      },
+      {
+        "tool": "map_mitre",
+        "args": {
+          "technique_ids": [
+            "T1059.001",
+            "T1027",
+            "T1140"
+          ]
+        }
+      }
+    ]
+  },
+  "credential_access": {
+    "description": "Investigate general credential access attempts including credential dumping, keylogging, brute force, and credential store access",
+    "plan": [
+      {
+        "tool": "parse_auth_log",
+        "args": {
+          "raw_log": "$raw_log"
+        }
+      },
+      {
+        "tool": "extract_usernames",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "extract_ipv4",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "extract_hashes",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "count_pattern",
+        "args": {
+          "text": "$raw_log",
+          "pattern": "(?i)credential|password|lsass|mimikatz|procdump|SAM|NTDS|vault|keylog|dpapi|sekurlsa|hashdump"
+        }
+      },
+      {
+        "tool": "score_generic",
+        "args": {
+          "indicators_found": "$step5",
+          "high_severity_count": 0,
+          "medium_severity_count": "$step5"
+        }
+      },
+      {
+        "tool": "correlate_with_history",
+        "args": {
+          "ioc_values": "$step3",
+          "lookback_hours": 72,
+          "history_context": "$correlation_context"
+        }
+      },
+      {
+        "tool": "map_mitre",
+        "args": {
+          "technique_ids": [
+            "T1003",
+            "T1003.001",
+            "T1110",
+            "T1555"
+          ]
+        }
+      }
+    ]
+  },
+  "api_key_abuse": {
+    "description": "Investigate API key abuse by detecting unauthorized API usage from external IPs, anomalous call patterns, and key exposure indicators",
+    "plan": [
+      {
+        "tool": "extract_ipv4",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "extract_emails",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "parse_http_request",
+        "args": {
+          "raw_log": "$raw_log"
+        }
+      },
+      {
+        "tool": "count_pattern",
+        "args": {
+          "text": "$raw_log",
+          "pattern": "(?i)api.key|token|bearer|authorization|unauthorized|403|401|rate.limit|key.exposed|secret"
+        }
+      },
+      {
+        "tool": "lookup_known_bad",
+        "args": {
+          "value": "$siem_event.source_ip",
+          "ioc_type": "ip"
+        }
+      },
+      {
+        "tool": "score_generic",
+        "args": {
+          "indicators_found": "$step4",
+          "high_severity_count": 0,
+          "medium_severity_count": "$step4"
+        }
+      },
+      {
+        "tool": "correlate_with_history",
+        "args": {
+          "ioc_values": "$step1",
+          "lookback_hours": 48,
+          "history_context": "$correlation_context"
+        }
+      },
+      {
+        "tool": "map_mitre",
+        "args": {
+          "technique_ids": [
+            "T1552.004",
+            "T1528"
+          ]
+        }
+      }
+    ]
+  },
+  "benign_system_event": {
+    "description": "Minimal investigation for benign system events -- extract IPs for record-keeping and score with zero indicators",
+    "plan": [
+      {
+        "tool": "extract_ipv4",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "score_generic",
+        "args": {
+          "indicators_found": 0,
+          "high_severity_count": 0,
+          "medium_severity_count": 0
+        }
+      }
+    ]
+  },
+  "probe_noop": {
+    "description": "e2e probe \u2014 deterministic no-op flow for scripts/e2e_probe.sh. Fixed verdict=benign risk_score=5. DO NOT use for real investigations.",
+    "plan": [
+      {
+        "tool": "extract_ipv4",
+        "args": {
+          "text": "$raw_log"
+        }
+      },
+      {
+        "tool": "map_mitre",
+        "args": {
+          "task_type": "probe_noop"
+        }
+      }
+    ]
+  }
 }

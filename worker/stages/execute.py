@@ -80,11 +80,39 @@ BLOCKED_PATTERNS = [
 BLOCKED_BUILTINS = {'open', 'eval', 'exec', 'compile', '__import__', 'breakpoint'}
 
 
+def _strip_comments_and_strings(code: str) -> str:
+    """Strip comments and string literals so blocked-string scan only sees
+    actual executable tokens. Uses the ast module when possible so we don't
+    false-positive on docstrings / comments mentioning `import os`."""
+    try:
+        tree = ast.parse(code)
+        # Use ast.unparse to re-emit the AST without comments. Docstrings are
+        # preserved as string literals; replace them with empty strings.
+        class _DocstringStripper(ast.NodeTransformer):
+            def visit_Expr(self, node):
+                if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+                    return ast.Expr(value=ast.Constant(value=""))
+                return node
+
+        stripped = _DocstringStripper().visit(tree)
+        ast.fix_missing_locations(stripped)
+        return ast.unparse(stripped)
+    except Exception:
+        # ast.parse failing will be handled by Layer 2. Return raw code.
+        return code
+
+
 def _check_blocked_strings(code: str) -> Tuple[bool, str]:
-    """Layer 1: Fast string-based pattern scan before AST parsing."""
-    code_lower = code.lower()
+    """Layer 1: Fast string-based pattern scan.
+
+    Audit 2.33: run the scan on AST-stripped code (no comments/docstrings),
+    so a legitimate comment like `# do not call os.environ here` isn't
+    flagged as an injection attempt.
+    """
+    scan = _strip_comments_and_strings(code)
+    scan_lower = scan.lower()
     for pattern in BLOCKED_PATTERNS:
-        if pattern.lower() in code_lower:
+        if pattern.lower() in scan_lower:
             return False, f"Blocked pattern: {pattern}"
     return True, "OK"
 
@@ -184,14 +212,20 @@ def _wrap_code_safely(code: str) -> str:
 
 # --- Stdout parser ---
 def _parse_stdout(stdout: str) -> Dict:
-    """Parse investigation JSON from stdout."""
+    """Parse investigation JSON from stdout.
+
+    Audit 2.32: bound the greedy regex search to stdout[:65536]. The previous
+    `.*` with `re.DOTALL` over multi-MB outputs is quadratic in the worst case.
+    64 KB is enough for every well-formed verdict payload the pipeline emits.
+    """
     if not stdout or not stdout.strip():
         return {}
     try:
         return json.loads(stdout.strip())
     except json.JSONDecodeError:
-        # Try to find JSON object in output
-        match = re.search(r'\{.*\}', stdout, re.DOTALL)
+        # Try to find JSON object within the first 64 KB of stdout.
+        window = stdout[:65536]
+        match = re.search(r'\{.*\}', window, re.DOTALL)
         if match:
             try:
                 return json.loads(match.group())

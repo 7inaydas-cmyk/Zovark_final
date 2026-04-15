@@ -1,0 +1,99 @@
+# Audit 3.1: exclude secrets, large artifacts, and docs from every Docker build
+# context in the repo root. Without this file, api/worker/healer Dockerfiles
+# with `context: .` pull in .env, models/*.gguf, the entire .git history, and
+# audit documents — blowing up image size and leaking credentials into layer
+# cache.
+
+# Secrets and local env
+.env
+.env.*
+!.env.example
+secrets.env
+*.pem
+*.key
+*.crt
+agent/keys/
+.credentials
+.vault_token
+
+# Git
+.git
+.gitignore
+.gitattributes
+
+# Model binaries
+models/
+*.gguf
+*.safetensors
+*.bin
+*.onnx
+
+# Data / state / caches
+data/
+state/
+archive/
+overnight_report_*/
+cache/
+tmp/
+*.sqlite
+*.duckdb
+
+# DPO training artifacts
+dpo/
+*.jsonl.gz
+
+# Docs (not needed in production images)
+docs/
+*.md
+!api/README.md
+!worker/README.md
+AUDIT_FINDINGS.md
+ENGINEERING_DISCIPLINE.md
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+venv/
+.venv/
+env/
+
+# Node (dashboard)
+dashboard/node_modules/
+dashboard/dist/
+dashboard/.vite/
+node_modules/
+
+# Go
+api/*.test
+api/coverage.out
+vendor/
+
+# Test fixtures and benchmarks
+tests/fixtures/large/
+autoresearch/*/results.jsonl
+autoresearch/*/*.log
+
+# OpenSpec working tree (not part of runtime)
+openspec/
+
+# Kiro / claude workspace metadata
+.kiro/
+.claude/
+.github/skills/
+.github/prompts/

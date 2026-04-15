@@ -28,9 +28,16 @@ SEVERITY_WINDOW_MULTIPLIER = {
 }
 
 
-def _batch_key(task_type: str, source_ip: str) -> str:
-    """Compute deterministic batch key from task_type + source_ip."""
-    raw = f"{task_type.lower().strip()}:{source_ip.strip()}"
+def _batch_key(tenant_id: str, task_type: str, source_ip: str) -> str:
+    """Compute deterministic batch key from tenant + task_type + source_ip.
+
+    Audit 2.12: tenant_id is mandatory — omitting it mixed alerts across tenants
+    with the same (task_type, source_ip) into a single aggregated event, which
+    leaked raw_log/username data across tenant boundaries.
+    """
+    if not tenant_id:
+        raise ValueError("smart_batcher: tenant_id is required")
+    raw = f"{tenant_id}:{task_type.lower().strip()}:{source_ip.strip()}"
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
@@ -60,7 +67,11 @@ class SmartBatcher:
         return BATCH_WINDOW_SECONDS * mult
 
     def should_batch(
-        self, task_type: str, siem_event: dict, severity: str = "medium"
+        self,
+        tenant_id: str,
+        task_type: str,
+        siem_event: dict,
+        severity: str = "medium",
     ) -> Tuple[bool, Optional[dict]]:
         """
         Decide whether to absorb or release this alert.
@@ -78,9 +89,19 @@ class SmartBatcher:
                 ip = ep.get("ip")
                 if isinstance(ip, str):
                     source_ip = ip
+        # Audit 2.13: fall back from "unknown" to something meaningful so alerts
+        # missing source_ip are still separated by rule_name / hostname and
+        # don't all pile into a single mega-batch per tenant.
         if not source_ip:
-            source_ip = "unknown"
-        bkey = _batch_key(task_type, source_ip)
+            hostname = siem_event.get("hostname") or ""
+            rule_name = siem_event.get("rule_name") or ""
+            if hostname:
+                source_ip = f"host:{hostname}"
+            elif rule_name:
+                source_ip = f"rule:{rule_name}"
+            else:
+                source_ip = "unknown"
+        bkey = _batch_key(tenant_id, task_type, source_ip)
         now = time.time()
         window = self._effective_window(severity)
 

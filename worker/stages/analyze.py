@@ -42,25 +42,20 @@ from stages.code_cache import get_alert_signature, get_cached_code, set_cached_c
 FAST_FILL = os.environ.get("ZOVARK_FAST_FILL", "false").lower() == "true"
 ZOVARK_MODE = os.getenv("ZOVARK_MODE", "full")  # "full" or "templates-only"
 ZOVARK_LLM_ENDPOINT = os.environ.get("ZOVARK_LLM_ENDPOINT", "http://zovark-inference:8080/v1/chat/completions")
-try:
-    from settings import settings as _settings
-    ZOVARK_LLM_KEY = os.environ.get("ZOVARK_LLM_KEY", _settings.llm_key.get_secret_value())
-    DATABASE_URL = os.environ.get("DATABASE_URL", _settings.database_url)
-except ImportError:
-    ZOVARK_LLM_KEY = os.environ.get("ZOVARK_LLM_KEY", "sk-zovark-dev-2026")
-    DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://zovark:hydra_dev_2026@pgbouncer:5432/zovark")
+# stabilize-runtime-hygiene: centralized LLM key + DB URL loading.
+# Pydantic raises ValidationError if ZOVARK_LLM_KEY / ZOVARK_DB_PASSWORD unset.
+from settings import settings as _settings
+ZOVARK_LLM_KEY = _settings.llm_key.get_secret_value()
+DATABASE_URL = os.environ.get("DATABASE_URL", _settings.database_url)
 
 # Model tier defaults — American models only (Meta Llama)
 TIER_GENERATE = {"model": MODEL_CODE, "max_tokens": 4096, "temperature": 0.3}   # Path C: code gen
 TIER_FILL = {"model": MODEL_FAST, "max_tokens": 1024, "temperature": 0.1}       # Path B: param fill
 
 # Redis client for code cache (mirrors ingest.py pattern)
+# stabilize-runtime-hygiene: centralized via settings; no fallback literal.
 import redis as _redis
-try:
-    from settings import settings as _settings_redis
-    _redis_url = os.environ.get("REDIS_URL", _settings_redis.redis_url)
-except ImportError:
-    _redis_url = os.environ.get("REDIS_URL", "redis://:hydra-redis-dev-2026@redis:6379/0")
+_redis_url = os.environ.get("REDIS_URL", _settings.redis_url)
 _redis_client = _redis.from_url(_redis_url, decode_responses=True)
 
 # Mock requests shim prepended to all generated code
@@ -449,9 +444,13 @@ async def _analyze_llm(ingest: IngestOutput) -> AnalyzeOutput:
         augmented_prompt = prompt
 
     # --- Code cache: check for cached LLM-generated code ---
+    # Tenant_id is now required (audit 2.10) — cross-tenant cache leak was a
+    # critical finding. analyze() runs inside a Temporal activity with ingest
+    # already populated, so tenant_id is guaranteed present.
+    tenant_id = getattr(ingest, "tenant_id", None) or ""
     rule_name = siem_event.get("rule_name", "") if isinstance(siem_event, dict) else ""
-    cache_sig = get_alert_signature(task_type, rule_name, siem_event)
-    cached_code = get_cached_code(_redis_client, cache_sig)
+    cache_sig = get_alert_signature(tenant_id, task_type, rule_name, siem_event)
+    cached_code = get_cached_code(_redis_client, tenant_id, cache_sig)
 
     if cached_code:
         activity.logger.info(f"Code cache HIT for {task_type} (sig={cache_sig}), skipping LLM")
@@ -478,8 +477,8 @@ async def _analyze_llm(ingest: IngestOutput) -> AnalyzeOutput:
         code = _scrub_code(result["content"])
         tokens_in, tokens_out = result["tokens_in"], result["tokens_out"]
 
-        # Cache the scrubbed code for future repeat alerts
-        set_cached_code(_redis_client, cache_sig, code)
+        # Cache the scrubbed code for future repeat alerts (tenant-scoped)
+        set_cached_code(_redis_client, tenant_id, cache_sig, code)
 
     generation_ms = int((time.time() - t0) * 1000)
 
@@ -625,7 +624,10 @@ async def _analyze_v3_tools(ingest: IngestOutput) -> AnalyzeOutput:
         plans_path = os.path.join(os.path.dirname(__file__), "..", "tools", "investigation_plans.json")
         with open(plans_path) as f:
             all_plans = json.load(f)
-        # Match by task_type (try exact match, then alias, then substring, then benign fallback)
+        # Audit 2.30: prefer exact-match → alias → longest-prefix, and log ambiguity.
+        # Previously a substring search broke on first match in dict insertion order,
+        # so `phishing` could resolve to either `phishing` or `phishing_investigation`
+        # depending on JSON file layout.
         task_type = ingest.task_type.lower().replace("-", "_")
         plan_data = all_plans.get(task_type) or all_plans.get(ingest.task_type)
         # Try alias mapping
@@ -633,12 +635,17 @@ async def _analyze_v3_tools(ingest: IngestOutput) -> AnalyzeOutput:
             alias_key = _PLAN_ALIASES.get(task_type)
             if alias_key:
                 plan_data = all_plans.get(alias_key)
-        # Try substring match (e.g. "phishing" matches "phishing_investigation")
+        # Deterministic substring match: pick the LONGEST matching key and log
+        # if more than one candidate exists.
         if not plan_data:
-            for key in all_plans:
-                if task_type in key or key.startswith(task_type):
-                    plan_data = all_plans[key]
-                    break
+            candidates = [k for k in all_plans if task_type in k or k.startswith(task_type)]
+            if candidates:
+                if len(candidates) > 1:
+                    activity.logger.info(
+                        f"plan_key_ambiguous task_type={task_type} candidates={candidates}"
+                    )
+                chosen = max(candidates, key=len)
+                plan_data = all_plans[chosen]
         # If task_type not found, check if this is a benign-routed alert
         # Ingest sets skill_id to UUID, so check skill_methodology or task_type patterns
         if not plan_data:
@@ -844,7 +851,9 @@ async def _analyze_alert_impl(data) -> dict:
             out = asdict(await _analyze_llm(ingest))
             trace_analyze_apply_result(_span, out)
             return out
-        except (RuntimeError, httpx.TimeoutException, httpx.ConnectError, Exception) as e:
+        # Audit 2.31: `Exception` subsumes the preceding classes; the narrow list
+        # was misleading. Keep the catch broad but make the intent explicit.
+        except Exception as e:  # noqa: BLE001 — fail-closed by design
             activity.logger.error(f"LLM unavailable for task {ingest.task_id}: {e}")
             # FAIL-CLOSED: Do NOT classify. Do NOT route to benign. Queue for human review.
             from stages.circuit_breaker import update_state

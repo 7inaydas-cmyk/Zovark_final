@@ -12,7 +12,7 @@ services:
     container_name: zovark-litellm
     command: --config /app/config.yaml --port 4000
     environment:
-      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:-sk-zovark-dev-2026}
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:?LITELLM_MASTER_KEY is required — see .env.example}
       - GROQ_API_KEY=${GROQ_API_KEY}
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
@@ -43,7 +43,7 @@ services:
   nats:
     image: nats:2.10-alpine
     container_name: zovark-nats
-    command: ["-js", "-sd", "/data", "-m", "8222", "--user", "${NATS_USER:-zovark}", "--pass", "${NATS_PASSWORD:-zovark-nats-dev-2026}"]
+    command: ["-js", "-sd", "/data", "-m", "8222", "--user", "${NATS_USER:?NATS_USER is required}", "--pass", "${NATS_PASSWORD:?NATS_PASSWORD is required — see .env.example}"]
     expose:
       - "4222"
       - "8222"

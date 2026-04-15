@@ -1,0 +1,32 @@
+475 worker/stages/store.py
+
+36:    except Exception:
+40:def _update_dedup_entry(conn, task_id: str, verdict: str, risk_score: int, status: str, siem_event: dict):
+50:                cur.execute(
+57:        except Exception:
+78:    except Exception as e:
+104:def _db_conn():
+116:                except Exception:
+119:                    except Exception:
+128:        except Exception:
+151:def _update_task_status(conn, task_id: str, status: str, output: dict,
+180:        cur.execute("SET LOCAL synchronous_commit = on;")
+181:        cur.execute("""
+203:def _save_pattern(conn, task_type: str, alert_sig: str, code: str,
+208:            cur.execute("""
+218:    except Exception as e:
+223:def _create_investigation(conn, tenant_id: str, task_id: str, verdict: str,
+231:            cur.execute("SET LOCAL synchronous_commit = on;")
+232:            cur.execute("""
+242:    except Exception as e:
+248:def _insert_audit_event(conn, tenant_id: str, event_type: str,
+254:            cur.execute("""
+263:    except Exception as e:
+300:        except Exception:
+339:                    cur.execute(f"SET LOCAL app.current_tenant = '{validated_tid}'")
+426:                    cur.execute("NOTIFY task_completed, %s", (notify_payload,))
+427:            except Exception as notify_err:
+448:        except Exception as dp_err:
+450:      except Exception as e:
+466:    except Exception:
+472:    except Exception:

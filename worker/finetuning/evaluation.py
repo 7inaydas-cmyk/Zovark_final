@@ -14,7 +14,9 @@ from finetuning.evaluator import evaluate_model
 
 
 def _get_db():
-    db_url = os.environ.get("DATABASE_URL", "postgresql://zovark:zovark_dev_2026@postgres:5432/zovark")
+    # stabilize-runtime-hygiene: centralized DB URL via settings; no fallback literal.
+    from settings import settings as _settings
+    db_url = os.environ.get("DATABASE_URL", _settings.database_url)
     return psycopg2.connect(db_url)
 
 

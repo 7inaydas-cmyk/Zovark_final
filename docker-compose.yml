@@ -15,11 +15,15 @@ services:
     container_name: zovark-postgres
     environment:
       POSTGRES_USER: zovark
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-zovark_dev_2026}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required — see .env.example}
       POSTGRES_DB: zovark
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      # database-seed-system change: fixture tenant + admin/analyst users with
+      # bcrypt cost-12 hashes. Runs automatically on fresh volume after init.sql.
+      # Manual re-seed: scripts/seed_dev.sh
+      - ./migrations/seed_dev_data.sql:/docker-entrypoint-initdb.d/02-seed-dev.sql:ro
       - ./config/postgresql.conf:/etc/postgresql/postgresql.conf:ro
       - ./config/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
     command: postgres -c config_file=/etc/postgresql/postgresql.conf -c hba_file=/etc/postgresql/pg_hba.conf
@@ -47,7 +51,7 @@ services:
       valkey-server
       --maxmemory 256mb
       --maxmemory-policy allkeys-lru
-      --requirepass ${REDIS_PASSWORD:-hydra-redis-dev-2026}
+      --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD is required — see .env.example}
       --rename-command FLUSHALL ""
       --rename-command CONFIG ""
       --rename-command DEBUG ""
@@ -56,7 +60,7 @@ services:
     expose:
       - "6379"
     healthcheck:
-      test: ["CMD", "valkey-cli", "-a", "${REDIS_PASSWORD:-hydra-redis-dev-2026}", "ping"]
+      test: ["CMD", "valkey-cli", "-a", "${REDIS_PASSWORD:?REDIS_PASSWORD is required}", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -73,11 +77,22 @@ services:
   surrealdb:
     image: surrealdb/surrealdb:v2.1.4
     container_name: zovark-surrealdb
+    # Audit 3.8: partial hardening. We keep user: "0:0" because the upstream
+    # surrealdb image expects to own /data; flipping to a non-root UID requires
+    # a coordinated volume-chown migration that is out of scope for this
+    # script-only pass. In the meantime drop all capabilities and deny
+    # privilege escalation so even as UID 0 the container can't acquire new
+    # caps or load kernel modules. Track full non-root migration in Batch C.
+    user: "0:0"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     environment:
       - SURREAL_SYNC_DATA=true
     command: >
       start --log warn
-      --user root --pass ${SURREAL_ROOT_PASSWORD:-change-me-surreal}
+      --user root --pass ${SURREAL_ROOT_PASSWORD:?SURREAL_ROOT_PASSWORD is required — see .env.example}
       rocksdb:/data/zovark.db?sync=every
     volumes:
       - surreal_data:/data
@@ -175,7 +190,7 @@ services:
     image: edoburu/pgbouncer:latest
     container_name: zovark-pgbouncer
     environment:
-      DATABASE_URL: postgres://zovark:${POSTGRES_PASSWORD:-zovark_dev_2026}@postgres:5432/zovark
+      DATABASE_URL: postgres://zovark:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required — see .env.example}@postgres:5432/zovark
       POOL_MODE: transaction
       AUTH_TYPE: scram-sha-256
       MAX_CLIENT_CONN: 400
@@ -190,7 +205,10 @@ services:
       postgres:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "pg_isready", "-h", "localhost", "-p", "5432"]
+      # Audit 3.13/3.14: bind to 127.0.0.1 explicitly. On Alpine/musl distros,
+      # `localhost` can resolve to ::1 first while pgbouncer listens on 0.0.0.0,
+      # producing intermittent probe timeouts.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U zovark || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -211,7 +229,7 @@ services:
       - DB=postgres12
       - DB_PORT=5432
       - POSTGRES_USER=zovark
-      - POSTGRES_PWD=${POSTGRES_PASSWORD:-zovark_dev_2026}
+      - POSTGRES_PWD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required — see .env.example}
       - POSTGRES_SEEDS=postgres
       - DYNAMIC_CONFIG_FILE_PATH=config/dynamicconfig/development-sql.yaml
     volumes:
@@ -238,7 +256,8 @@ services:
       - TEMPORAL_ADDRESS=temporal:7233
       - TEMPORAL_CORS_ORIGINS=http://localhost:3000
     ports:
-      - "8080:8080"
+      # Audit 3.9: loopback-only; Temporal UI is an operator debug surface.
+      - "127.0.0.1:8080:8080"
     depends_on:
       temporal:
         condition: service_started
@@ -255,7 +274,7 @@ services:
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-zovark}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-zovark_dev_2026}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required — see .env.example}
     volumes:
       - minio_data:/data
     expose:
@@ -320,7 +339,8 @@ services:
         limits:
           memory: 4G
     ports:
-      - "11434:11434"
+      # Audit 3.9: loopback-only; LLM endpoint is only reached from sibling containers.
+      - "127.0.0.1:11434:11434"
     profiles:
       - airgap-ollama
     restart: unless-stopped
@@ -345,13 +365,13 @@ services:
       start_period: 10s
     environment:
       - PORT=8090
-      - DATABASE_URL=postgresql://zovark:${POSTGRES_PASSWORD:-zovark_dev_2026}@pgbouncer:5432/zovark
+      - DATABASE_URL=postgresql://zovark:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required — see .env.example}@pgbouncer:5432/zovark
       - TEMPORAL_ADDRESS=temporal:7233
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-      - ZOVARK_LLM_KEY=${ZOVARK_LLM_KEY:-}
-      - JWT_SECRET=${JWT_SECRET:-zovark-jwt-secret-dev-2026-CHANGE-ME-IN-PRODUCTION-min-32-chars}
-      - REDIS_URL=redis://:${REDIS_PASSWORD:-zovark-redis-dev-2026}@redis:6379/0
-      - REDIS_PASSWORD=${REDIS_PASSWORD:-zovark-redis-dev-2026}
+      - ZOVARK_LLM_KEY=${ZOVARK_LLM_KEY:?ZOVARK_LLM_KEY is required — see .env.example}
+      - JWT_SECRET=${JWT_SECRET:?JWT_SECRET is required — generate via openssl rand base64 64}
+      - REDIS_URL=redis://:${REDIS_PASSWORD:?REDIS_PASSWORD is required — see .env.example}@redis:6379/0
+      - REDIS_PASSWORD=${REDIS_PASSWORD:?REDIS_PASSWORD is required — see .env.example}
       - ZOVARK_REDPANDA_BROKERS=redpanda:9092
       - ZOVARK_PLATFORM_INGEST_BEARER=${ZOVARK_PLATFORM_INGEST_BEARER:-}
       - ZOVARK_ENCRYPTION_KEY=${ZOVARK_ENCRYPTION_KEY:-}
@@ -389,17 +409,21 @@ services:
     # No container_name — allows docker compose --scale worker=N
     environment:
       # Workers go through PgBouncer (transaction pooling)
-      - DATABASE_URL=postgresql://zovark:${POSTGRES_PASSWORD:-zovark_dev_2026}@pgbouncer:5432/zovark
+      - DATABASE_URL=postgresql://zovark:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required — see .env.example}@pgbouncer:5432/zovark
+      # stabilize-runtime-hygiene: Pydantic settings require these at worker init.
+      - ZOVARK_DB_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required — see .env.example}
+      - ZOVARK_REDIS_PASSWORD=${REDIS_PASSWORD:?REDIS_PASSWORD is required — see .env.example}
       - TEMPORAL_ADDRESS=temporal:7233
       - ZOVARK_LLM_PROVIDER=${ZOVARK_LLM_PROVIDER:-openai}
       - ZOVARK_LLM_ENDPOINT=${ZOVARK_LLM_ENDPOINT:-https://api.openai.com/v1/chat/completions}
       - ZOVARK_LLM_ENDPOINT_FAST=${ZOVARK_LLM_ENDPOINT_FAST:-https://api.openai.com/v1/chat/completions}
       - ZOVARK_LLM_ENDPOINT_CODE=${ZOVARK_LLM_ENDPOINT_CODE:-https://api.openai.com/v1/chat/completions}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-      - ZOVARK_LLM_KEY=${ZOVARK_LLM_KEY:-}
+      # stabilize-runtime-hygiene: required Pydantic field (see worker/settings.py)
+      - ZOVARK_LLM_KEY=${ZOVARK_LLM_KEY:?ZOVARK_LLM_KEY is required — see .env.example}
       - ZOVARK_MODEL_FAST=${ZOVARK_MODEL_FAST:-gpt-4o-mini}
       - ZOVARK_MODEL_CODE=${ZOVARK_MODEL_CODE:-gpt-4o-mini}
-      - REDIS_URL=redis://:${REDIS_PASSWORD:-zovark-redis-dev-2026}@redis:6379/0
+      - REDIS_URL=redis://:${REDIS_PASSWORD:?REDIS_PASSWORD is required — see .env.example}@redis:6379/0
       - HOST_SANDBOX_DIR=${PWD}/sandbox
       - DEDUP_ENABLED=${DEDUP_ENABLED:-true}
       - ZOVARK_MODE=${ZOVARK_MODE:-full}
@@ -418,7 +442,7 @@ services:
       - PYTHONUNBUFFERED=1
       - ZOVARK_REDPANDA_BROKERS=redpanda:9092
       - ZOVARK_SURREAL_HTTP_URL=http://surrealdb:8000
-      - ZOVARK_SURREAL_PASSWORD=${SURREAL_ROOT_PASSWORD:-change-me-surreal}
+      - ZOVARK_SURREAL_PASSWORD=${SURREAL_ROOT_PASSWORD:?SURREAL_ROOT_PASSWORD is required — see .env.example}
       - ZOVARK_SURREAL_ENABLED=true
       - ZOVARK_ENTITY_GRAPH_STORE=surreal
       - DOCKER_HOST=tcp://docker-socket-proxy:2375
@@ -472,7 +496,9 @@ services:
         VITE_SIGNOZ_UI_BASE: ${VITE_SIGNOZ_UI_BASE:-http://127.0.0.1:3301}
     container_name: zovark-dashboard
     ports:
-      - "3000:3000"
+      # Audit 3.9: loopback-only; use docker-compose.override.yml.example to
+      # expose on LAN for cross-host development.
+      - "127.0.0.1:3000:3000"
     healthcheck:
       test: ["CMD", "wget", "-qO-", "--timeout=3", "http://127.0.0.1:3000/"]
       interval: 15s
@@ -493,7 +519,8 @@ services:
     image: bkimminich/juice-shop:latest
     container_name: zovark-juice-shop
     ports:
-      - "3001:3000"
+      # Audit 3.9: loopback-only; SIEM lab benchmark target, never external.
+      - "127.0.0.1:3001:3000"
     profiles: ["benchmark", "siem-lab"]
     deploy:
       resources:
@@ -510,13 +537,13 @@ services:
     container_name: zovark-temporal-exporter
     command: python /app/monitoring/temporal_exporter.py
     environment:
-      - DATABASE_URL=postgresql://zovark:${POSTGRES_PASSWORD:-zovark_dev_2026}@postgres:5432/zovark
+      - DATABASE_URL=postgresql://zovark:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required — see .env.example}@postgres:5432/zovark
       - TEMPORAL_ADDRESS=temporal:7233
       - EXPORTER_PORT=9092
     volumes:
       - ./monitoring:/app/monitoring:ro
     ports:
-      - "9092:9092"
+      - "127.0.0.1:9092:9092"
     depends_on:
       postgres:
         condition: service_healthy
@@ -540,7 +567,7 @@ services:
       - ./monitoring/alert_rules.yml:/etc/prometheus/alert_rules.yml:ro
       - prometheus_data:/prometheus
     ports:
-      - "9090:9090"
+      - "127.0.0.1:9090:9090"
     depends_on:
       - temporal-exporter
     profiles: ["monitoring"]
@@ -557,8 +584,9 @@ services:
     image: grafana/grafana:11.0.0
     container_name: zovark-grafana
     environment:
-      - GF_SECURITY_ADMIN_USER=admin
-      - GF_SECURITY_ADMIN_PASSWORD=zovark
+      # Audit 3.11: password comes from env — no hardcoded "zovark" default.
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD must be set}
       - GF_USERS_ALLOW_SIGN_UP=false
       - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/var/lib/grafana/dashboards/zovark-overview.json
     volumes:
@@ -568,7 +596,7 @@ services:
       - ./monitoring/grafana/dashboards/worker-performance.json:/var/lib/grafana/dashboards/worker-performance.json:ro
       - grafana_data:/var/lib/grafana
     ports:
-      - "3002:3000"
+      - "127.0.0.1:3002:3000"
     depends_on:
       - prometheus
     profiles: ["monitoring"]
@@ -585,9 +613,9 @@ services:
     image: prometheuscommunity/postgres-exporter:v0.15.0
     container_name: zovark-postgres-exporter
     environment:
-      DATA_SOURCE_NAME: "postgresql://zovark:${POSTGRES_PASSWORD:-zovark_dev_2026}@postgres:5432/zovark?sslmode=prefer"
+      DATA_SOURCE_NAME: "postgresql://zovark:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required — see .env.example}@postgres:5432/zovark?sslmode=prefer"
     ports:
-      - "9187:9187"
+      - "127.0.0.1:9187:9187"
     depends_on:
       postgres:
         condition: service_healthy
@@ -606,9 +634,9 @@ services:
     container_name: zovark-redis-exporter
     environment:
       REDIS_ADDR: redis://redis:6379
-      REDIS_PASSWORD: ${REDIS_PASSWORD:-zovark-redis-dev-2026}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required — see .env.example}
     ports:
-      - "9121:9121"
+      - "127.0.0.1:9121:9121"
     depends_on:
       redis:
         condition: service_healthy
@@ -628,13 +656,13 @@ services:
     container_name: zovark-worker-metrics
     command: python /app/monitoring/worker_metrics.py
     environment:
-      - DATABASE_URL=postgresql://zovark:${POSTGRES_PASSWORD:-zovark_dev_2026}@postgres:5432/zovark
-      - REDIS_URL=redis://:${REDIS_PASSWORD:-zovark-redis-dev-2026}@redis:6379/0
+      - DATABASE_URL=postgresql://zovark:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required — see .env.example}@postgres:5432/zovark
+      - REDIS_URL=redis://:${REDIS_PASSWORD:?REDIS_PASSWORD is required — see .env.example}@redis:6379/0
       - METRICS_PORT=9093
     volumes:
       - ./monitoring:/app/monitoring:ro
     ports:
-      - "9093:9093"
+      - "127.0.0.1:9093:9093"
     depends_on:
       postgres:
         condition: service_healthy
@@ -655,12 +683,36 @@ services:
     image: tecnativa/docker-socket-proxy:latest
     container_name: zovark-docker-proxy
     restart: unless-stopped
-    privileged: true
+    # Audit 3.7: the tecnativa image does NOT require privileged mode — it
+    # only needs the socket. Privileged gave cap_sys_admin to a
+    # network-exposed filter. Dropped plus defense-in-depth hardening.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    # telemetry-audit-fix D3: the tecnativa image uses haproxy internally, which
+    # writes a pid file to /tmp/haproxy.pid on startup. With read_only: true the
+    # rootfs is immutable, so we provide a 4M tmpfs at /tmp with noexec/nosuid
+    # to keep defence-in-depth. Without this, haproxy fails to start and
+    # downstream healer / worker docker calls all hang.
+    tmpfs:
+      - /tmp:size=4m,noexec,nosuid
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     environment:
       CONTAINERS: 1
       POST: 1
+      # telemetry-audit-fix D2: Python Docker SDK init issues GET /_ping and
+      # GET /version during DockerClient() construction. Without these three
+      # allowlist entries the SDK blocks for minutes and the healer never
+      # reaches `app.run(host='0.0.0.0', port=8081)` — the root cause of the
+      # healer=fail row in stack_healthcheck. INFO is used by healer's crash
+      # diagnosis feature which calls GET /info. All three endpoints are
+      # read-only per tecnativa docs; no new write surface is added.
+      PING: 1
+      VERSION: 1
+      INFO: 1
       IMAGES: 0
       NETWORKS: 0
       VOLUMES: 0
@@ -672,7 +724,6 @@ services:
       SECRETS: 0
       CONFIGS: 0
       PLUGINS: 0
-      INFO: 0
       EVENTS: 0
       AUTH: 0
       BUILD: 0
@@ -737,17 +788,25 @@ services:
       context: ./agent
       dockerfile: Dockerfile
     container_name: zovark-healer
-    restart: always
+    # Audit 3.16: unless-stopped so `docker compose stop healer` actually stops.
+    restart: unless-stopped
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
+      # Audit 3.6: healer no longer bind-mounts /var/run/docker.sock directly.
+      # It routes Docker API calls through docker-socket-proxy via DOCKER_HOST
+      # below, so an RCE in the healer can't escape to host root.
       - healer-logs:/var/log/zovark
+    depends_on:
+      docker-socket-proxy:
+        condition: service_started
     environment:
       - HEALER_CHECK_INTERVAL=30
+      # Audit 3.6: all docker CLI calls go through the socket-proxy on tcp:2375.
+      - DOCKER_HOST=tcp://docker-socket-proxy:2375
       # Aligned with worker/settings.py ZOVARK_ prefix
       - ZOVARK_DB_USER=${POSTGRES_USER:-zovark}
-      - ZOVARK_DB_PASSWORD=${POSTGRES_PASSWORD:-hydra_dev_2026}
+      - ZOVARK_DB_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required — see .env.example}
       - ZOVARK_DB_NAME=${POSTGRES_DB:-zovark}
-      - ZOVARK_REDIS_PASSWORD=${REDIS_PASSWORD:-hydra-redis-dev-2026}
+      - ZOVARK_REDIS_PASSWORD=${REDIS_PASSWORD:?REDIS_PASSWORD is required — see .env.example}
       - ZOVARK_LLM_PROVIDER=${ZOVARK_LLM_PROVIDER:-openai}
       - ZOVARK_LLM_FAST_MODEL=${ZOVARK_MODEL_FAST:-gpt-4o-mini}
       - ZOVARK_LLM_BASE_URL=${ZOVARK_LLM_BASE_URL:-https://api.openai.com}
@@ -755,14 +814,30 @@ services:
       - ZOVARK_LLM_KEY=${ZOVARK_LLM_KEY:-}
       - ZOVARK_OTEL_ENABLED=${OTEL_ENABLED:-true}
       - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-http://zovark-signoz-collector:4318}
+    # Audit 3.5: re-declare healthcheck at compose level. The Dockerfile has
+    # one too, but depends_on: condition: service_healthy requires it here.
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "--max-time", "3", "http://127.0.0.1:8081/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # telemetry-audit-fix D4: bumped from 30s so the Docker SDK init has time
+      # to complete even on slow runners (pings the socket-proxy handshake).
+      start_period: 60s
+    # Audit 3.16: defence in depth.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     ports:
-      - "8081:8081"
+      - "127.0.0.1:8081:8081"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     deploy:
       resources:
         limits:
           memory: 512M
+          cpus: '0.5'
     networks:
       - zovark-internal
 
@@ -773,11 +848,18 @@ services:
     container_name: zovark-elasticsearch
     environment:
       - discovery.type=single-node
-      - xpack.security.enabled=false
-      - xpack.security.http.ssl.enabled=false
+      # Audit 3.12: xpack security is opt-in via ELASTIC_XPACK_SECURITY=true.
+      # Default stays OFF for the dev lab flow (contributor runs siem-lab
+      # profile for benchmarks without bootstrapping elastic passwords), but
+      # the profile is gated behind loopback-only port binding above (3.9) so
+      # it's not LAN-exposed. Flip to "true" and set ELASTIC_PASSWORD in your
+      # .env for a closer-to-prod configuration.
+      - xpack.security.enabled=${ELASTIC_XPACK_SECURITY:-false}
+      - xpack.security.http.ssl.enabled=${ELASTIC_XPACK_SECURITY:-false}
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD:-}
       - ES_JAVA_OPTS=-Xms512m -Xmx512m
     ports:
-      - "9200:9200"
+      - "127.0.0.1:9200:9200"
     volumes:
       - es-data:/usr/share/elasticsearch/data
     healthcheck:
@@ -795,7 +877,7 @@ services:
     environment:
       - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
     ports:
-      - "5601:5601"
+      - "127.0.0.1:5601:5601"
     depends_on:
       elasticsearch:
         condition: service_healthy
@@ -807,7 +889,7 @@ services:
     profiles: ["siem-lab"]
     container_name: zovark-nginx-proxy
     ports:
-      - "8080:80"
+      - "127.0.0.1:8080:80"
     volumes:
       - ./siem-lab/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./siem-lab/logs:/var/log/nginx
@@ -891,7 +973,7 @@ services:
       zovark-signoz-schema-sync:
         condition: service_completed_successfully
     ports:
-      - "3301:8080"
+      - "127.0.0.1:3301:8080"
     volumes:
       - ./config/signoz/prometheus.yml:/root/config/prometheus.yml:ro
       - ./config/signoz/dashboards:/root/config/dashboards:ro
@@ -899,6 +981,7 @@ services:
     environment:
       - SIGNOZ_ALERTMANAGER_PROVIDER=signoz
       - SIGNOZ_TELEMETRYSTORE_CLICKHOUSE_DSN=tcp://zovark-clickhouse:9000
+      # (Audit 3.9: Signoz UI port below is loopback-only)
       - SIGNOZ_SQLSTORE_SQLITE_PATH=/var/lib/signoz/signoz.db
       - DASHBOARDS_PATH=/root/config/dashboards
       - STORAGE=clickhouse
@@ -934,9 +1017,11 @@ services:
       - OTEL_RESOURCE_ATTRIBUTES=host.name=zovark-signoz-collector,os.type=linux
       - LOW_CARDINAL_EXCEPTION_GROUPING=false
     ports:
-      - "4317:4317"
-      - "4318:4318"
-      - "13133:13133"
+      # Audit 3.9: OTLP endpoints are loopback-only; sibling containers reach
+      # the collector over the internal bridge, not via host ports.
+      - "127.0.0.1:4317:4317"
+      - "127.0.0.1:4318:4318"
+      - "127.0.0.1:13133:13133"
     volumes:
       - ./config/signoz/otel-collector-config.yaml:/etc/otel-collector-config.yaml:ro
       - ./config/signoz/otel-collector-opamp-config.yaml:/etc/manager-config.yaml:ro

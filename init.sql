@@ -407,10 +407,10 @@ GROUP BY t.id, tn.name;
 -- ============================================================
 -- SEED DATA (Development only)
 -- ============================================================
-
-INSERT INTO tenants (name, slug, tier) VALUES
-    ('Hydra Dev', 'hydra-dev', 'enterprise')
-ON CONFLICT (slug) DO NOTHING;
+-- database-seed-system change: the dev tenant + fixture users are now owned
+-- by migrations/seed_dev_data.sql (mounted at /docker-entrypoint-initdb.d/
+-- 02-seed-dev.sql). The old 'Hydra Dev' insert was removed to avoid two
+-- parallel dev tenants. Canonical dev tenant: zovark-dev (UUID …0010).
 
 -- ============================================================
 -- ENTITY GRAPH (Sprint 1G)
@@ -1273,7 +1273,7 @@ CREATE TABLE IF NOT EXISTS shadow_recommendations (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     tenant_id UUID NOT NULL REFERENCES tenants(id),
     task_id UUID REFERENCES agent_tasks(id),
-    investigation_id UUID REFERENCES investigations(id),
+    investigation_id UUID,
     alert_type VARCHAR(100),
     alert_source VARCHAR(100),
     recommended_action VARCHAR(50) NOT NULL,

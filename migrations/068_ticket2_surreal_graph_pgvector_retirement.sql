@@ -1,6 +1,14 @@
 -- Migration 068: Ticket 2 — retire PostgreSQL entity graph + pgvector (SurrealDB canonical)
 -- Idempotent. Preserves OLTP tables and agent_tasks.dedup_hash index from 065.
 
+-- Audit 3.21: drop materialized views + views that depend on the entity graph
+-- tables BEFORE the CASCADE drops them implicitly. Without this, the cascade
+-- silently destroys `cross_tenant_intel` / `cross_tenant_public` and any code
+-- still calling `REFRESH MATERIALIZED VIEW cross_tenant_intel` explodes on
+-- the next tick. Re-creation (if needed) happens in a follow-up migration.
+DROP MATERIALIZED VIEW IF EXISTS cross_tenant_intel CASCADE;
+DROP VIEW IF EXISTS cross_tenant_public CASCADE;
+
 -- HNSW / IVFFlat indexes on vector columns (drop before ALTER COLUMN)
 DROP INDEX IF EXISTS idx_entities_embedding_hnsw;
 DROP INDEX IF EXISTS idx_entity_edges_embedding_hnsw;

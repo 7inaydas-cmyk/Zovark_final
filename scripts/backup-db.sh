@@ -1,17 +1,21 @@
-#!/bin/sh
+#!/bin/bash
 # ============================================================
 # ZOVARK Database Backup Script
 # Dumps PostgreSQL, compresses, uploads to MinIO
 # Retention: 7 daily + 4 weekly backups
 # Usage: ./scripts/backup-db.sh
 # ============================================================
-set -eu
+# Audit 3.18: bash (not sh) so PIPESTATUS is available; strict pipefail; no
+# more silent password default; stderr redirected so pg_dump failures surface.
+set -euo pipefail
+
+# Required: POSTGRES_PASSWORD must be set via env / secrets — no dev default.
+: "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set (no silent default)}"
 
 # Configuration
 POSTGRES_HOST="${POSTGRES_HOST:-localhost}"
 POSTGRES_PORT="${POSTGRES_PORT:-5432}"
 POSTGRES_USER="${POSTGRES_USER:-zovark}"
-POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-zovark_dev_2026}"
 POSTGRES_DB="${POSTGRES_DB:-zovark}"
 MINIO_ALIAS="${MINIO_ALIAS:-zovark}"
 MINIO_ENDPOINT="${MINIO_ENDPOINT:-http://localhost:9000}"
@@ -58,7 +62,16 @@ pg_dump \
     --format=plain \
     --no-owner \
     --no-acl \
-    --verbose 2>/dev/null | gzip > "${BACKUP_PATH}"
+    --verbose 2>"${BACKUP_DIR}/${DAILY_FILE}.stderr" | gzip > "${BACKUP_PATH}"
+
+# Audit 3.18: pipefail isn't sufficient when only the tail command succeeds —
+# check PIPESTATUS explicitly so a failed pg_dump can't produce a clean gzip.
+if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+    log "ERROR: pg_dump failed (see ${BACKUP_DIR}/${DAILY_FILE}.stderr)"
+    cat "${BACKUP_DIR}/${DAILY_FILE}.stderr" >&2 || true
+    rm -f "${BACKUP_PATH}"
+    exit 1
+fi
 
 BACKUP_SIZE=$(ls -lh "${BACKUP_PATH}" | awk '{print $5}')
 log "Backup created: ${BACKUP_PATH} (${BACKUP_SIZE})"

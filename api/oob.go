@@ -2,24 +2,68 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"runtime"
 	"strings"
 	"sync"
 	"time"
 )
 
-// startOOBServer launches a plain net/http server on :9091 for out-of-band
-// diagnostics. It is intentionally outside the Gin router so it stays
-// reachable even when the main API is saturated or deadlocked.
+// oobBindAddr returns the bind address for the OOB watchdog.
+// Audit 1.2: default to 127.0.0.1:9091 so a misconfigured host network doesn't
+// expose DB/Redis/Temporal status to the LAN. The container compose file
+// already port-maps to 127.0.0.1:9091, but defence in depth says we also bind
+// loopback inside the container.
+func oobBindAddr() string {
+	if v := strings.TrimSpace(os.Getenv("ZOVARK_OOB_BIND")); v != "" {
+		return v
+	}
+	return "127.0.0.1:9091"
+}
+
+// oobRequireToken returns the shared secret required in the X-Zovark-OOB-Token
+// header. If empty, authentication is disabled (dev convenience — compose file
+// runs on loopback anyway).
+func oobRequireToken() string {
+	return strings.TrimSpace(os.Getenv("ZOVARK_OOB_TOKEN"))
+}
+
+// oobAuthMiddleware enforces the shared-secret header when ZOVARK_OOB_TOKEN is
+// set. Comparison is constant-time to eliminate timing oracles.
+func oobAuthMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		required := oobRequireToken()
+		if required == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		provided := strings.TrimSpace(r.Header.Get("X-Zovark-OOB-Token"))
+		if subtle.ConstantTimeCompare([]byte(provided), []byte(required)) != 1 {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// startOOBServer launches a plain net/http server on 127.0.0.1:9091 for
+// out-of-band diagnostics. It is intentionally outside the Gin router so it
+// stays reachable even when the main API is saturated or deadlocked.
+//
+// Audit 1.2: binds to loopback by default (env: ZOVARK_OOB_BIND override) and
+// requires a shared-secret X-Zovark-OOB-Token header when ZOVARK_OOB_TOKEN is
+// set. With loopback binding this endpoint is no longer reachable from the
+// LAN even if the container's host network leaks.
 func startOOBServer(ready chan<- struct{}) {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/debug/state", oobStateHandler)
+	mux.Handle("/debug/state", oobAuthMiddleware(http.HandlerFunc(oobStateHandler)))
 
 	srv := &http.Server{
 		Handler:      mux,
@@ -27,15 +71,16 @@ func startOOBServer(ready chan<- struct{}) {
 		WriteTimeout: 10 * time.Second,
 	}
 
+	bindAddr := oobBindAddr()
 	// Bind first, then signal ready — guarantees OOB is accepting connections
 	// before main server starts.
-	listener, err := net.Listen("tcp", ":9091")
+	listener, err := net.Listen("tcp", bindAddr)
 	if err != nil {
-		log.Printf("[WARN] OOB server cannot bind :9091: %v", err)
+		log.Printf("[WARN] OOB server cannot bind %s: %v", bindAddr, err)
 		close(ready)
 		return
 	}
-	log.Println("OOB watchdog listening on :9091")
+	log.Printf("OOB watchdog listening on %s (auth=%v)", bindAddr, oobRequireToken() != "")
 	close(ready)
 
 	if err := srv.Serve(listener); err != nil && err != http.ErrServerClosed {

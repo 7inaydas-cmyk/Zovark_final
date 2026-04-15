@@ -130,23 +130,28 @@ func complianceReportHandler(c *gin.Context) {
 			evidence["event_count"] = eventCount
 			evidence["mapped_events"] = ctrl.Events
 
-			// Sample event IDs (up to 5)
+			// Sample event IDs (up to 5). rows.Close() MUST run at end of each loop
+			// iteration — `defer` inside a for-loop holds every rows open until the
+			// handler returns, draining the pool under load.
 			var sampleIDs []string
 			for _, eventType := range ctrl.Events {
-				rows, err := dbPool.Query(ctx, `
-					SELECT id FROM audit_events
-					WHERE tenant_id = $1 AND event_type = $2
-					AND created_at >= $3 AND created_at < $4
-					ORDER BY created_at DESC LIMIT 5
-				`, tenantID, eventType, startDate, endDateInclusive)
-				if err == nil {
+				func() {
+					rows, err := dbPool.Query(ctx, `
+						SELECT id FROM audit_events
+						WHERE tenant_id = $1 AND event_type = $2
+						AND created_at >= $3 AND created_at < $4
+						ORDER BY created_at DESC LIMIT 5
+					`, tenantID, eventType, startDate, endDateInclusive)
+					if err != nil {
+						return
+					}
 					defer rows.Close()
 					for rows.Next() {
 						var id string
 						rows.Scan(&id)
 						sampleIDs = append(sampleIDs, id)
 					}
-				}
+				}()
 			}
 			evidence["sample_event_ids"] = sampleIDs
 		} else {

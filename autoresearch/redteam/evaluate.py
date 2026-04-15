@@ -11,7 +11,7 @@ import re
 import time
 import math
 import hashlib
-from datetime import datetime
+from datetime import datetime, timezone
 from collections import Counter
 
 # Add project root to path
@@ -88,7 +88,8 @@ def evaluate_payload(payload: dict) -> dict:
         "payload_hash": hashlib.sha256(
             json.dumps(payload, sort_keys=True).encode()
         ).hexdigest()[:16],
-        "timestamp": datetime.utcnow().isoformat(),
+        # Audit 5.18: datetime.utcnow() is deprecated in Python 3.12+.
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
     siem_event = payload.get("siem_event", {})

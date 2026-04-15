@@ -65,6 +65,50 @@ var authLimiter = &rateLimiter{
 	limit:    10, // 10 attempts per 15 minutes per IP
 }
 
+// authLimiterSweepOnce deletes entries whose latest timestamp is older than
+// the rate-limit window. Called periodically by a background goroutine so the
+// map doesn't grow unbounded with stale IPs. Audit 1.16.
+func (rl *rateLimiter) sweepOnce() (before, after int) {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	before = len(rl.attempts)
+	cutoff := time.Now().Add(-rl.window)
+	for k, ts := range rl.attempts {
+		keep := ts[:0]
+		for _, t := range ts {
+			if t.After(cutoff) {
+				keep = append(keep, t)
+			}
+		}
+		if len(keep) == 0 {
+			delete(rl.attempts, k)
+		} else {
+			rl.attempts[k] = keep
+		}
+	}
+	after = len(rl.attempts)
+	return
+}
+
+// startAuthLimiterSweeper runs rl.sweepOnce() every 60 seconds until ctx is
+// cancelled. Wrap with safeGoroutine() so a panic can't take the API down.
+// Audit 1.16.
+func startAuthLimiterSweeper(ctx context.Context) {
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			before, after := authLimiter.sweepOnce()
+			if before != after {
+				log.Printf("[authLimiter] sweep: %d → %d entries", before, after)
+			}
+		}
+	}
+}
+
 func (rl *rateLimiter) allow(key string) bool {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
@@ -140,41 +184,64 @@ func auditMiddleware() gin.HandlerFunc {
 
 // ============================================================
 // ACCOUNT LOCKOUT
+//
+// Audit 1.15: the three operations used to be independent UPDATE + SELECT +
+// optional UPDATE statements on context.Background(). Two concurrent failed
+// logins could both read failed_login_attempts=4 and neither would trip the
+// lockout threshold, letting the counter race past 5 silently. The unified
+// path below uses a single `UPDATE ... RETURNING` per event so the increment
+// and the threshold check are atomic, and every call now propagates the
+// request context for tracing/cancellation.
 // ============================================================
 
-func checkAccountLocked(email string) bool {
+const lockoutThreshold = 5
+const lockoutDuration = 30 * time.Minute
+
+func checkAccountLocked(ctx context.Context, email string) bool {
 	var lockedUntil *time.Time
-	err := dbPool.QueryRow(context.Background(),
+	err := dbPool.QueryRow(ctx,
 		"SELECT locked_until FROM users WHERE email = $1", email,
 	).Scan(&lockedUntil)
 	if err != nil {
 		return false
 	}
-	if lockedUntil != nil && lockedUntil.After(time.Now()) {
-		return true
-	}
-	return false
+	return lockedUntil != nil && lockedUntil.After(time.Now())
 }
 
-func recordFailedLogin(email string) {
-	_, _ = dbPool.Exec(context.Background(),
-		"UPDATE users SET failed_login_attempts = failed_login_attempts + 1 WHERE email = $1", email)
-
-	// Lock account after 5 failed attempts
+// recordFailedLogin atomically bumps the fail counter and, if the new count
+// crosses the threshold, sets locked_until in the same statement. A second
+// concurrent failure racing the first is serialized by the row lock taken
+// inside the UPDATE.
+func recordFailedLogin(ctx context.Context, email string) {
+	const q = `
+		UPDATE users
+		   SET failed_login_attempts = failed_login_attempts + 1,
+		       locked_until = CASE
+		           WHEN failed_login_attempts + 1 >= $2
+		           THEN NOW() + ($3 || ' seconds')::interval
+		           ELSE locked_until
+		       END
+		 WHERE email = $1
+		RETURNING failed_login_attempts, locked_until`
 	var attempts int
-	_ = dbPool.QueryRow(context.Background(),
-		"SELECT failed_login_attempts FROM users WHERE email = $1", email,
-	).Scan(&attempts)
-
-	if attempts >= 5 {
-		lockUntil := time.Now().Add(30 * time.Minute)
-		_, _ = dbPool.Exec(context.Background(),
-			"UPDATE users SET locked_until = $1 WHERE email = $2", lockUntil, email)
+	var lockedUntil *time.Time
+	err := dbPool.QueryRow(ctx, q,
+		email,
+		lockoutThreshold,
+		int(lockoutDuration.Seconds()),
+	).Scan(&attempts, &lockedUntil)
+	if err != nil {
+		// User may not exist (email-enumeration path) — swallow silently.
+		return
+	}
+	if lockedUntil != nil && attempts >= lockoutThreshold {
+		log.Printf("[lockout] account locked: email=%s attempts=%d until=%s",
+			email, attempts, lockedUntil.Format(time.RFC3339))
 	}
 }
 
-func recordSuccessfulLogin(email string) {
-	_, _ = dbPool.Exec(context.Background(),
+func recordSuccessfulLogin(ctx context.Context, email string) {
+	_, _ = dbPool.Exec(ctx,
 		"UPDATE users SET failed_login_attempts = 0, locked_until = NULL, last_login_at = NOW() WHERE email = $1", email)
 }
 

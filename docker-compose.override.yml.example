@@ -1,0 +1,49 @@
+# Local dev override — copy to `docker-compose.override.yml` to expose selected
+# services on your LAN. docker-compose.override.yml is loaded automatically,
+# and it is gitignored so your local exposure settings don't end up in a commit.
+#
+# Audit 3.9/3.10: the base docker-compose.yml binds almost every port to
+# 127.0.0.1 so a fresh clone is not a LAN liability. If you need to reach the
+# dashboard / grafana / kibana from another laptop on the same network, uncomment
+# the services below.
+#
+# USAGE:
+#   cp docker-compose.override.yml.example docker-compose.override.yml
+#   # edit to taste, then:
+#   docker compose up -d
+
+services:
+  # Dashboard — default: 127.0.0.1:3000, override: 0.0.0.0:3000
+  # dashboard:
+  #   ports:
+  #     - "0.0.0.0:3000:3000"
+
+  # Grafana — default: 127.0.0.1:3002, override to expose the monitoring UI
+  # grafana:
+  #   ports:
+  #     - "0.0.0.0:3002:3000"
+
+  # Kibana (siem-lab profile)
+  # kibana:
+  #   ports:
+  #     - "0.0.0.0:5601:5601"
+
+  # Temporal UI (debug profile)
+  # temporal-ui:
+  #   ports:
+  #     - "0.0.0.0:8080:8080"
+
+  # Signoz frontend
+  # zovark-signoz:
+  #   ports:
+  #     - "0.0.0.0:3301:8080"
+
+  # Prometheus
+  # prometheus:
+  #   ports:
+  #     - "0.0.0.0:9090:9090"
+
+  # Elasticsearch (siem-lab profile) — EXPOSING THIS IS USUALLY A BAD IDEA
+  # elasticsearch:
+  #   ports:
+  #     - "0.0.0.0:9200:9200"

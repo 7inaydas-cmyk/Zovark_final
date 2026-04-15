@@ -13,6 +13,7 @@ package handlers
 
 import (
 	"context"
+	"crypto/subtle"
 	"fmt"
 	"io"
 	"net/http"
@@ -104,7 +105,13 @@ func PlatformTrainingIngest(deps PlatformIngestDeps) gin.HandlerFunc {
 
 		auth := strings.TrimSpace(c.GetHeader("Authorization"))
 		const p = "Bearer "
-		if !strings.HasPrefix(auth, p) || strings.TrimSpace(auth[len(p):]) != secret {
+		if !strings.HasPrefix(auth, p) {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or missing bearer token"})
+			return
+		}
+		provided := strings.TrimSpace(auth[len(p):])
+		// Constant-time comparison — prevents timing side-channel on the platform ingest token.
+		if subtle.ConstantTimeCompare([]byte(provided), []byte(secret)) != 1 {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or missing bearer token"})
 			return
 		}

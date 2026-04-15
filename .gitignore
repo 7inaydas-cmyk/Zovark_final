@@ -14,6 +14,10 @@ models/zovark-merged/
 secrets.env
 !secrets.env.example
 
+# Audit 3.10: local dev override for docker-compose (see override.yml.example)
+docker-compose.override.yml
+!docker-compose.override.yml.example
+
 # Development artifacts
 batch_results*.json
 benchmark_*.txt

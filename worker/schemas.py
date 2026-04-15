@@ -7,16 +7,25 @@ Invalid data is caught gracefully — investigations never crash from validation
 import re
 import logging
 from typing import Literal
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 logger = logging.getLogger(__name__)
 
-_MITRE_PATTERN = re.compile(r"^T\d{4}(\.\d{3})?$")
+# Audit 2.24: accept both techniques (T1234, T1234.001) and tactic IDs (TA0001–TA0043).
+# Previously dropped every TA#### silently at validate_mitre_ids.
+_MITRE_PATTERN = re.compile(r"^T(?:A\d{4}|\d{4}(?:\.\d{3})?)$")
 
 
 class IOCItem(BaseModel):
     """Validates an Indicator of Compromise."""
-    ioc_type: Literal["ip", "domain", "url", "hash_md5", "hash_sha1", "hash_sha256", "email", "username", "cve"]
+    # Audit 2.25: accept both "ioc_type" and "type" keys. Every pipeline producer
+    # writes "type", so strict validation would silently drop every IOC.
+    model_config = ConfigDict(populate_by_name=True)
+
+    ioc_type: Literal[
+        "ip", "domain", "url", "hash_md5", "hash_sha1", "hash_sha256",
+        "email", "username", "cve",
+    ] = Field(alias="type")
     value: str = Field(min_length=1)
     context: str = ""
 

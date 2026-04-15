@@ -14,6 +14,12 @@ def get_v2_activities():
 
 
 def get_v2_workflows():
-    """Return all V2 workflows for Temporal worker registration."""
-    from .investigation_workflow import InvestigationWorkflowV2
-    return [InvestigationWorkflowV2]
+    """Return all V2 workflows for Temporal worker registration.
+
+    The class symbol is `InvestigationWorkflow` but the Temporal wire name
+    remains `"InvestigationWorkflowV2"` — see
+    worker/stages/investigation_workflow.py for the `@workflow.defn(name=...)`
+    decorator that preserves the wire name.
+    """
+    from .investigation_workflow import InvestigationWorkflow
+    return [InvestigationWorkflow]

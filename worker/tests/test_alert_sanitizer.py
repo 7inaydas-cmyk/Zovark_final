@@ -214,9 +214,19 @@ class TestStage4StructuralNormalization:
         self.s = AlertSanitizer()
 
     def test_deep_nesting_does_not_crash(self):
+        # Audit 5.12: assert the structural invariant, not just `is not None`.
+        # An accidental empty dict regression would otherwise pass this test.
         alert = {"a": {"b": {"c": {"d": {"e": {"f": {"g": "deep"}}}}}}}
         result = self.s.sanitize(alert)
-        assert result is not None
+        assert isinstance(result, dict), "sanitize must return a dict"
+        assert "a" in result, "top-level key must survive"
+        level2 = result["a"]
+        assert isinstance(level2, dict), "level 2 must remain a dict"
+        assert "b" in level2
+        # At max_depth=5 the sanitizer must either keep the dict or stringify
+        # the leaf — either way, the bottom level cannot vanish entirely.
+        leaf = result["a"]["b"]["c"]["d"]["e"]
+        assert leaf is not None and leaf != {}
 
     def test_depth_5_still_dict(self):
         # depth 0→1→2→3→4 = 5 levels, should still be a dict at level 4

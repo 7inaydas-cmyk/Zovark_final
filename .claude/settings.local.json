@@ -1,7 +1,11 @@
 {
   "permissions": {
     "allow": [
-      "mcp__hydra__zovark_query"
+      "mcp__hydra__zovark_query",
+      "Bash(grep:*)",
+      "Bash(ls:*)",
+      "Bash(openspec status:*)",
+      "Bash(openspec instructions:*)"
     ]
   }
 }

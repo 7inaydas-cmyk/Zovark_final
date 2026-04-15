@@ -96,10 +96,39 @@ const getHeaders = () => {
     return headers;
 };
 
+// Audit 4.5: default per-request timeout. `AbortSignal.timeout` is native in
+// modern Chromium/Firefox/Safari; fall back to manual AbortController on old
+// targets (Vite target is ES2020 which includes AbortController).
+const DEFAULT_TIMEOUT_MS = 15_000;
+
+function withTimeoutSignal(options: RequestInit, ms: number = DEFAULT_TIMEOUT_MS): RequestInit {
+    // If caller already passed a signal, respect it and do NOT override —
+    // effect hooks thread their own AbortController through for cancellation.
+    if (options.signal) {
+        return options;
+    }
+    try {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const sig = (AbortSignal as any).timeout?.(ms);
+        if (sig) {
+            return { ...options, signal: sig };
+        }
+    } catch {
+        /* fall through to manual controller */
+    }
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), ms);
+    return { ...options, signal: controller.signal };
+}
+
 // Wrapper that automatically retries on 401 by refreshing the token
 const fetchWithRefresh = async (url: string, options: RequestInit = {}): Promise<Response> => {
     // Ensure cookies are sent for refresh token
     options.credentials = 'include';
+
+    // Audit 4.5: enforce a default request timeout so a hung API doesn't
+    // leave the UI spinner forever.
+    options = withTimeoutSignal(options);
 
     let response = await fetch(url, options);
     captureApiTraceId(response);
@@ -111,8 +140,14 @@ const fetchWithRefresh = async (url: string, options: RequestInit = {}): Promise
             if (jwtToken) {
                 newHeaders['Authorization'] = `Bearer ${jwtToken}`;
             }
-            options.headers = newHeaders;
-            response = await fetch(url, options);
+            // Reset the timeout signal for the retry so we don't inherit an
+            // already-aborted controller from the original attempt.
+            const retryOpts: RequestInit = {
+                ...options,
+                headers: newHeaders,
+                signal: undefined,
+            };
+            response = await fetch(url, withTimeoutSignal(retryOpts));
             captureApiTraceId(response);
         }
     }

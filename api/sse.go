@@ -4,9 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -15,6 +15,41 @@ import (
 // ============================================================
 // SERVER-SENT EVENTS FOR REAL-TIME UPDATES (Issue #19)
 // ============================================================
+
+// sseMaxSubscribers caps concurrent SSE clients holding a pgxpool connection
+// for LISTEN. Default is min(pool/3, 200); overridable via env. See task 1.8.
+var sseMaxSubscribers int64 = 200
+
+// sseActiveSubscribers is the current count of active LISTEN-holding SSE clients.
+var sseActiveSubscribers int64
+
+// firstN returns s[:n] if len(s) >= n, else s. Bounds-safe substring.
+// Used to avoid panics on short UUIDs in log/message fields.
+func firstN(s string, n int) string {
+	if n < 0 || len(s) <= n {
+		return s
+	}
+	return s[:n]
+}
+
+// sseWriteJSONEvent emits a well-formed SSE event frame with JSON-marshalled data.
+// Returns false if the write to the client failed (slow/disconnected consumer).
+func sseWriteJSONEvent(c *gin.Context, event string, payload interface{}) bool {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return false
+	}
+	if event != "" {
+		if _, werr := c.Writer.WriteString("event: " + event + "\n"); werr != nil {
+			return false
+		}
+	}
+	if _, werr := c.Writer.WriteString("data: " + string(data) + "\n\n"); werr != nil {
+		return false
+	}
+	c.Writer.Flush()
+	return true
+}
 
 // taskSSEHandler streams task status updates via Server-Sent Events.
 // GET /api/v1/tasks/:id/stream
@@ -43,10 +78,11 @@ func taskSSEHandler(c *gin.Context) {
 	var lastStatus string
 	var lastStepCount int
 
-	// Send initial connection event
-	c.Writer.WriteString("event: connected\n")
-	c.Writer.WriteString(fmt.Sprintf("data: {\"task_id\":\"%s\",\"message\":\"SSE stream connected\"}\n\n", taskID))
-	c.Writer.Flush()
+	// Send initial connection event (JSON-encoded to prevent injection via task_id).
+	sseWriteJSONEvent(c, "connected", map[string]string{
+		"task_id": taskID,
+		"message": "SSE stream connected",
+	})
 
 	// Poll every 2 seconds
 	ticker := time.NewTicker(2 * time.Second)
@@ -78,11 +114,13 @@ func taskSSEHandler(c *gin.Context) {
 
 			// Check for status change
 			if status != lastStatus {
-				c.Writer.WriteString("event: status_changed\n")
-				dataBytes, _ := json.Marshal(map[string]string{"task_id": taskID, "status": status, "previous_status": lastStatus})
-				data := string(dataBytes)
-				c.Writer.WriteString(fmt.Sprintf("data: %s\n\n", data))
-				c.Writer.Flush()
+				if !sseWriteJSONEvent(c, "status_changed", map[string]string{
+					"task_id":         taskID,
+					"status":          status,
+					"previous_status": lastStatus,
+				}) {
+					return
+				}
 				lastStatus = status
 			}
 
@@ -103,7 +141,6 @@ func taskSSEHandler(c *gin.Context) {
 					 ORDER BY step_number DESC LIMIT 1`, taskID, tenantID,
 				).Scan(&stepNum, &stepType, &stepStatus, &stepOutput)
 
-				c.Writer.WriteString("event: step_completed\n")
 				outputSnippet := ""
 				if stepOutput != nil {
 					outputSnippet = *stepOutput
@@ -111,22 +148,30 @@ func taskSSEHandler(c *gin.Context) {
 						outputSnippet = outputSnippet[:500] + "..."
 					}
 				}
-				stepBytes, _ := json.Marshal(map[string]interface{}{"task_id": taskID, "step_number": stepNum, "step_type": stepType, "status": stepStatus, "output": outputSnippet})
-				c.Writer.WriteString(fmt.Sprintf("data: %s\n\n", string(stepBytes)))
-				c.Writer.Flush()
+				if !sseWriteJSONEvent(c, "step_completed", map[string]interface{}{
+					"task_id":     taskID,
+					"step_number": stepNum,
+					"step_type":   stepType,
+					"status":      stepStatus,
+					"output":      outputSnippet,
+				}) {
+					return
+				}
 				lastStepCount = stepCount
 			}
 
 			// If investigation is complete, send final event and close
 			if status == "completed" || status == "failed" || status == "cancelled" {
-				c.Writer.WriteString("event: investigation_complete\n")
 				ms := 0
 				if executionMs != nil {
 					ms = *executionMs
 				}
-				completeBytes, _ := json.Marshal(map[string]interface{}{"task_id": taskID, "status": status, "execution_ms": ms, "step_count": stepCount})
-				c.Writer.WriteString(fmt.Sprintf("data: %s\n\n", string(completeBytes)))
-				c.Writer.Flush()
+				sseWriteJSONEvent(c, "investigation_complete", map[string]interface{}{
+					"task_id":      taskID,
+					"status":       status,
+					"execution_ms": ms,
+					"step_count":   stepCount,
+				})
 				return
 			}
 		}
@@ -136,25 +181,42 @@ func taskSSEHandler(c *gin.Context) {
 // streamAllTaskUpdates provides a global SSE stream for all task completions.
 // GET /api/v1/tasks/stream
 // Supports token as query param since EventSource doesn't support headers.
+//
+// NOTE(audit 1.8): Each LISTEN connection holds a pgxpool slot for its lifetime
+// (PostgreSQL requires the same backend for the entire LISTEN). We cap the
+// concurrent subscriber count below the pool size so SSE cannot drain every
+// connection and starve normal API queries.
 func streamAllTaskUpdates(c *gin.Context) {
 	tenantID := c.MustGet("tenant_id").(string)
+
+	// Capacity check: bound concurrent LISTEN holders.
+	if atomic.LoadInt64(&sseActiveSubscribers) >= sseMaxSubscribers {
+		c.Header("Retry-After", "5")
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error": "sse capacity exceeded",
+			"code":  "sse_capacity_exceeded",
+		})
+		return
+	}
+	atomic.AddInt64(&sseActiveSubscribers, 1)
+	defer atomic.AddInt64(&sseActiveSubscribers, -1)
 
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
 	c.Header("X-Accel-Buffering", "no")
 
-	// Send connected event
-	c.Writer.WriteString("event: connected\n")
-	c.Writer.WriteString(fmt.Sprintf("data: {\"message\":\"SSE stream connected\",\"tenant\":\"%s\"}\n\n", tenantID[:8]))
-	c.Writer.Flush()
+	// Send connected event — bounds-safe tenant prefix via firstN, JSON payload.
+	sseWriteJSONEvent(c, "connected", map[string]string{
+		"message": "SSE stream connected",
+		"tenant":  firstN(tenantID, 8),
+	})
 
 	// Try to use PostgreSQL LISTEN/NOTIFY
 	conn, err := dbPool.Acquire(c.Request.Context())
 	if err != nil {
 		log.Printf("SSE: failed to acquire DB connection: %v", err)
-		c.Writer.WriteString(fmt.Sprintf("event: error\ndata: {\"error\":\"db connection failed\"}\n\n"))
-		c.Writer.Flush()
+		sseWriteJSONEvent(c, "error", map[string]string{"error": "db connection failed"})
 		return
 	}
 	defer conn.Release()
@@ -227,15 +289,15 @@ func streamAllTaskUpdates(c *gin.Context) {
 				triggerPushbackFromNotify(tid, ptid)
 			}
 		}
-		if _, werr := c.Writer.WriteString(fmt.Sprintf("event: %s\n", eventType)); werr != nil {
+		if _, werr := c.Writer.WriteString("event: " + eventType + "\n"); werr != nil {
 			return
 		}
 		if traceID, ok := payload["trace_id"].(string); ok && traceID != "" {
-			if _, werr := c.Writer.WriteString(fmt.Sprintf("id: %s\n", traceID)); werr != nil {
+			if _, werr := c.Writer.WriteString("id: " + traceID + "\n"); werr != nil {
 				return
 			}
 		}
-		if _, werr := c.Writer.WriteString(fmt.Sprintf("data: %s\n\n", string(data))); werr != nil {
+		if _, werr := c.Writer.WriteString("data: " + string(data) + "\n\n"); werr != nil {
 			return
 		}
 		c.Writer.Flush()
@@ -272,17 +334,13 @@ func streamAllTasksPolling(c *gin.Context, tenantID string) {
 				if err := rows.Scan(&id, &taskType, &status, &verdict, &riskScore); err != nil {
 					continue
 				}
-				evt := map[string]interface{}{
+				sseWriteJSONEvent(c, "task_completed", map[string]interface{}{
 					"task_id":    id,
 					"task_type":  taskType,
 					"status":     status,
 					"verdict":    verdict,
 					"risk_score": riskScore,
-				}
-				data, _ := json.Marshal(evt)
-				c.Writer.WriteString("event: task_completed\n")
-				c.Writer.WriteString(fmt.Sprintf("data: %s\n\n", string(data)))
-				c.Writer.Flush()
+				})
 			}
 			rows.Close()
 			lastCheck = time.Now()

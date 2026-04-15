@@ -1,0 +1,28 @@
+=== §6 verification FAILED on 2026-04-13T17:29:25+05:30 ===
+
+verify task_id: 7932cbfe-2237-46a4-b49a-f813ad91b439
+polled 30x over 60s, status never left 'pending'
+
+=== current task state ===
+{"approval_reason":null,"approval_risk_level":null,"approval_status":null,"completed_at":null,"created_at":"2026-04-13T11:56:47.589584Z","current_step":null,"execution_ms":null,"input":{"prompt":"SSH brute force","severity":"high","siem_event":{"raw_log":"500 failed for root from 185.220.101.45","rule_name":"BruteForce","source_ip":"185.220.101.45","title":"SSH BF","username":"root"}},"output":null,"pending_approval_id":null,"severity":null,"status":"pending","step_count":0,"task_id":"7932cbfe-2237-46a4-b49a-f813ad91b439","task_type":"brute_force","tokens_used_input":0,"tokens_used_output":0}
+
+=== worker log lines for the verifying task ===
+{"ts": 1776081408.6049347, "level": "info", "msg": "Started workflow from Redpanda", "worker": "55bc508056c6-1-qv00", "workflow": "InvestigationWorkflowV2", "task_id": "7932cbfe-2237-46a4-b49a-f813ad91b439"}
+Pattern save failed (non-fatal): column "task_type" of relation "investigation_memory" does not exist
+LINE 3:                 (task_type, alert_signature, code_template, ...
+--
+
+Audit event insert failed (non-fatal): current transaction is aborted, commands ignored until end of transaction block
+
+NOTIFY failed (non-fatal): current transaction is aborted, commands ignored until end of transaction block
+
+[STORE] WARNING: agent_tasks.dedup_hash missing for task_id=7932cbfe-2237-46a4-b49a-f813ad91b439; skipping Redis dedup entry update (API-only dedup hash ownership)
+
+=== root cause ===
+store.py uses ONE transaction per investigation. _save_pattern hits the
+investigation_memory schema fork (column 'task_type' does not exist), which
+aborts the postgres transaction. The Python try/except catches the python
+exception but the underlying postgres txn is poisoned — every subsequent
+statement is rejected, and conn.commit() implicitly rolls everything back.
+The _update_task_status UPDATE that ran successfully (with model_name='unknown')
+is rolled back along with everything else. Task stays pending.

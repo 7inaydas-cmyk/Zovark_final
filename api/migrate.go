@@ -32,10 +32,17 @@ func runMigrations(command string, args []string) {
 }
 
 func ensureMigrationTable() {
+	// Schema matches migrations/072_schema_migrations_ledger.sql so this code
+	// path and the bash runner (scripts/apply_migrations.sh) write to the
+	// same ledger and produce comparable rows. See
+	// docs/RUNBOOK_HEALTHCHECK.md#schema-drift for the design notes.
 	_, err := dbPool.Exec(context.Background(), `
 		CREATE TABLE IF NOT EXISTS schema_migrations (
-			version VARCHAR(255) PRIMARY KEY,
-			applied_at TIMESTAMPTZ DEFAULT NOW()
+			filename     TEXT PRIMARY KEY,
+			applied_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+			applied_by   TEXT NOT NULL DEFAULT current_user,
+			source       TEXT NOT NULL CHECK (source IN ('init_sql', 'migration_runner', 'manual_backfill')),
+			checksum     TEXT
 		)
 	`)
 	if err != nil {
@@ -62,7 +69,7 @@ func releaseMigrationLock() {
 func getAppliedMigrations() map[string]bool {
 	ensureMigrationTable()
 	rows, err := dbPool.Query(context.Background(),
-		"SELECT version FROM schema_migrations ORDER BY version")
+		"SELECT filename FROM schema_migrations ORDER BY filename")
 	if err != nil {
 		log.Fatalf("Failed to query migrations: %v", err)
 	}
@@ -70,9 +77,9 @@ func getAppliedMigrations() map[string]bool {
 
 	applied := make(map[string]bool)
 	for rows.Next() {
-		var version string
-		rows.Scan(&version)
-		applied[version] = true
+		var filename string
+		rows.Scan(&filename)
+		applied[filename] = true
 	}
 	return applied
 }
@@ -135,7 +142,8 @@ func migrateUp() {
 		}
 
 		_, err = dbPool.Exec(context.Background(),
-			"INSERT INTO schema_migrations (version) VALUES ($1)", version)
+			"INSERT INTO schema_migrations (filename, applied_by, source, checksum) VALUES ($1, $2, 'migration_runner', '') ON CONFLICT (filename) DO NOTHING",
+			version, "hydra-api migrate up")
 		if err != nil {
 			log.Fatalf("Failed to record migration %s: %v", version, err)
 		}

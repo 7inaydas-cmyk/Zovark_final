@@ -3,14 +3,61 @@ package main
 import (
 	"context"
 	"log"
+	"net/http"
 	"os"
+	"os/signal"
+	"runtime/debug"
+	"strconv"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
 
 	apihandlers "github.com/hydra-platform/hydra-api/handlers"
 )
+
+// safeGoroutine runs fn in a new goroutine with a panic-recover. If fn panics,
+// the goroutine logs the panic (with stack) instead of crashing the whole API
+// process. Use for all fire-and-forget background work — audit writes, pushback,
+// apikey stamp updates, materialized-view refreshes — where a nil dbPool during
+// shutdown or a pgx bug would otherwise take the server down.
+func safeGoroutine(name string, fn func(ctx context.Context)) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[safeGoroutine:%s] panic recovered: %v\n%s", name, r, debug.Stack())
+			}
+		}()
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		fn(ctx)
+	}()
+}
+
+// initSSELimits sets sseMaxSubscribers from ZOVARK_SSE_MAX_SUBSCRIBERS env
+// (default min(pool/3, 200)). Called once from main() after initDB.
+func initSSELimits() {
+	if raw := strings.TrimSpace(os.Getenv("ZOVARK_SSE_MAX_SUBSCRIBERS")); raw != "" {
+		if n, err := strconv.ParseInt(raw, 10, 64); err == nil && n > 0 {
+			atomic.StoreInt64(&sseMaxSubscribers, n)
+			return
+		}
+	}
+	// Try to derive from pool capacity.
+	if dbPool != nil {
+		poolCap := dbPool.Config().MaxConns
+		calc := int64(poolCap) / 3
+		if calc < 8 {
+			calc = 8
+		}
+		if calc > 200 {
+			calc = 200
+		}
+		atomic.StoreInt64(&sseMaxSubscribers, calc)
+	}
+}
 
 var (
 	appConfig *Config
@@ -114,6 +161,9 @@ func main() {
 	}
 	defer closeDB()
 
+	// Configure SSE subscriber cap after pool is ready (task 1.8).
+	initSSELimits()
+
 	// Initialize Redis for rate limiting
 	initRedis()
 	instrumentRedisOTel()
@@ -136,6 +186,13 @@ func main() {
 	drainCtx, drainCancel := context.WithCancel(context.Background())
 	defer drainCancel()
 	go startQueueDrainLoop(drainCtx)
+
+	// Audit 1.16: start the auth rate-limiter sweeper so the in-memory attempts
+	// map doesn't grow unbounded with stale IPs.
+	safeGoroutine("authLimiter.sweeper", func(ctx context.Context) {
+		<-drainCtx.Done() // tie sweeper lifetime to drain goroutine
+	})
+	go startAuthLimiterSweeper(drainCtx)
 
 	// Setup Gin router
 	router := gin.Default()
@@ -238,6 +295,7 @@ func main() {
 
 		// Diagnostic export — Flight Data Recorder (Mission 6)
 		api.GET("/admin/diagnostics/export", requireRole("admin"), diagnosticExportHandler)
+		api.POST("/admin/diagnostics/probe-db", requireRole("admin"), probeDBHandler)
 
 		// Compliance Evidence Engine (Mission 7)
 		api.POST("/compliance/report/:framework", requireRole("admin", "analyst"), complianceReportHandler)
@@ -422,9 +480,57 @@ func main() {
 		log.Println("[oob] WARNING: watchdog did not become ready in 5s, proceeding anyway")
 	}
 
-	// Start server
-	log.Printf("Listening and serving HTTP on :%s\n", appConfig.Port)
-	if err := router.Run(":" + appConfig.Port); err != nil {
-		log.Fatalf("Failed to start server: %v", err)
+	// Audit 1.1: graceful shutdown. Previously router.Run() blocked forever and
+	// SIGTERM killed in-flight ingest inserts, Temporal publishes, and the
+	// drain goroutine mid-work. We now:
+	//   1. wrap the gin handler in an http.Server
+	//   2. install a signal handler for SIGINT / SIGTERM
+	//   3. on signal: cancel the drain goroutine (drainCancel) FIRST so it
+	//      doesn't claim new rows during shutdown
+	//   4. call server.Shutdown(ctx) with a deadline so in-flight HTTP
+	//      requests can complete
+	//   5. fall through to the existing defers (closeDB, closeTemporal,
+	//      closeRedpandaWriter) after the server has drained
+	srv := &http.Server{
+		Addr:    ":" + appConfig.Port,
+		Handler: router,
+		// Modest timeouts — the audit SSE code assumes hours-long connections,
+		// so we can't set a ReadTimeout or WriteTimeout here without breaking
+		// the existing streams. A dedicated ReadHeaderTimeout is safe.
+		ReadHeaderTimeout: 15 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
+
+	serverErrCh := make(chan error, 1)
+	go func() {
+		log.Printf("Listening and serving HTTP on %s\n", srv.Addr)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			serverErrCh <- err
+		}
+	}()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	select {
+	case err := <-serverErrCh:
+		log.Fatalf("http.Server failed: %v", err)
+	case sig := <-sigCh:
+		log.Printf("[shutdown] signal received: %s", sig)
+	}
+
+	// Order matters. Stop claiming new work before draining HTTP.
+	log.Println("[shutdown] stopping drain goroutine")
+	drainCancel()
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer shutdownCancel()
+
+	log.Println("[shutdown] http.Server.Shutdown (30s deadline)")
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("[shutdown] server.Shutdown returned: %v", err)
+	}
+
+	log.Println("[shutdown] http server drained; running deferred cleanup")
+	// Deferred closeDB / closeTemporal / closeRedpandaWriter run on main exit.
 }

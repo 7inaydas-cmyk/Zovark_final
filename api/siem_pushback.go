@@ -6,7 +6,11 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
+	"os"
+	"strings"
 	"time"
 )
 
@@ -143,11 +147,60 @@ func buildWebhookPayload(inv investigationResult) ([]byte, error) {
 	return json.Marshal(payload)
 }
 
+// isPrivateOrLinkLocal blocks SSRF to RFC1918, loopback, link-local, and cloud metadata endpoints.
+// Returns (blocked, reason).
+func isPrivateOrLinkLocal(rawURL string) (bool, string) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return true, "malformed url"
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return true, "non-http(s) scheme"
+	}
+	host := u.Hostname()
+	if host == "" {
+		return true, "empty host"
+	}
+	// Block well-known metadata hostnames.
+	lower := strings.ToLower(host)
+	if lower == "metadata.google.internal" || lower == "metadata" || lower == "localhost" {
+		return true, "blocked hostname: " + lower
+	}
+	// Resolve to IPs and check each.
+	ips, err := net.LookupIP(host)
+	if err != nil || len(ips) == 0 {
+		// If we cannot resolve, err on the side of caution.
+		return true, "resolve failed"
+	}
+	for _, ip := range ips {
+		if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsPrivate() || ip.IsUnspecified() {
+			return true, "private/loopback/link-local ip: " + ip.String()
+		}
+		// Cloud metadata IPv4 (169.254.169.254 is caught by IsLinkLocalUnicast; also catch 100.100.100.200 Alibaba etc.).
+		if ip.String() == "100.100.100.200" {
+			return true, "cloud metadata ip"
+		}
+	}
+	return false, ""
+}
+
 // pushVerdictToSIEM sends the investigation verdict to the configured SIEM.
 // Fire-and-forget — errors are logged but never propagated.
 func pushVerdictToSIEM(ctx context.Context, inv investigationResult) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[PUSHBACK] panic recovered in pushVerdictToSIEM for task %s: %v", inv.TaskID, r)
+		}
+	}()
+
 	cfg := getPushbackConfig(ctx)
 	if !cfg.Enabled || cfg.URL == "" {
+		return
+	}
+
+	// SSRF deny-list — refuse to POST to private/link-local/metadata addresses.
+	if blocked, reason := isPrivateOrLinkLocal(cfg.URL); blocked {
+		log.Printf("[PUSHBACK] refused: %s (%s)", cfg.URL, reason)
 		return
 	}
 
@@ -187,18 +240,31 @@ func pushVerdictToSIEM(ctx context.Context, inv investigationResult) {
 		url = cfg.URL + "/zovark-verdicts/_doc"
 	}
 
+	// In production, refuse to disable TLS verification regardless of operator config.
+	// The VerifyTLS knob is honoured only when ZOVARK_DEPLOYMENT_MODE != "prod".
+	verifyTLS := cfg.VerifyTLS
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("ZOVARK_DEPLOYMENT_MODE")), "prod") && !verifyTLS {
+		log.Printf("[PUSHBACK] refusing to honour verify_tls=false in production mode; forcing verification on")
+		verifyTLS = true
+	}
+
 	client := &http.Client{
 		Timeout: 10 * time.Second,
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: !cfg.VerifyTLS,
+				InsecureSkipVerify: !verifyTLS,
+				MinVersion:         tls.VersionTLS12,
 			},
 		},
 	}
 
 	// 2 attempts with 10s timeout
 	for attempt := 0; attempt < 2; attempt++ {
-		req, _ := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(payload))
+		req, reqErr := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(payload))
+		if reqErr != nil {
+			log.Printf("[PUSHBACK] attempt %d: NewRequest failed: %v", attempt+1, reqErr)
+			return
+		}
 		for k, v := range headers {
 			req.Header.Set(k, v)
 		}
@@ -224,8 +290,17 @@ func pushVerdictToSIEM(ctx context.Context, inv investigationResult) {
 // Loads the investigation and fires push-back in a goroutine.
 func triggerPushbackFromNotify(taskID, tenantID string) {
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[PUSHBACK] panic recovered in triggerPushbackFromNotify for task %s: %v", taskID, r)
+			}
+		}()
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
+
+		if dbPool == nil {
+			return
+		}
 
 		cfg := getPushbackConfig(ctx)
 		if !cfg.Enabled {

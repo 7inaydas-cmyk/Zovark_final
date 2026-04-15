@@ -1,0 +1,20 @@
+=== 047 ledger row ===
+        filename        |       applied_at       |         applied_by         |  source  | checksum 
+------------------------+------------------------+----------------------------+----------+----------
+ 047_add_model_name.sql | 2026-01-01 00:00:00+00 | init_sql_freeze_2026-04-13 | init_sql | 
+(1 row)
+
+
+=== model_name column presence ===
+            col            | exists 
+---------------------------+--------
+ agent_tasks.model_name    | f
+ investigations.model_name | f
+(2 rows)
+
+
+=== indexes (should be empty) ===
+ indexname 
+-----------
+(0 rows)
+

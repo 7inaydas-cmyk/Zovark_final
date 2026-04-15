@@ -11,7 +11,9 @@ from typing import Optional, Tuple
 import psycopg2
 
 logger = logging.getLogger(__name__)
-DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://zovark:hydra_dev_2026@postgres:5432/zovark")
+# stabilize-runtime-hygiene: centralized DB URL via settings.
+from settings import settings as _settings
+DATABASE_URL = os.environ.get("DATABASE_URL", _settings.database_url)
 
 
 def generate_template_slug(task_type: str, task_id: str) -> str:

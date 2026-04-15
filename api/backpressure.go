@@ -53,7 +53,12 @@ const backpressureKey = "temporal:workflow_starts"
 // allowed=true means a new workflow can be started.
 // allowed=false with queueDepth < hard limit means "queue it".
 // allowed=false with queueDepth >= hard limit means "reject".
-// Fail-open: returns (true, 0) if Redis is unavailable.
+//
+// Audit 1.21: FAIL-CLOSED on Redis error. Previously this returned (true, 0)
+// on any Redis hiccup, silently disabling backpressure and admitting unlimited
+// concurrent workflow starts. Now on Redis error we return (false, soft_limit)
+// so the caller routes new tasks into the queued-for-drain path instead of
+// flooding Temporal. Per-command errors in the pipeline are also inspected.
 func checkBackpressure(ctx context.Context) (bool, int) {
 	if !backpressureEnabled || redisClient == nil {
 		return true, 0
@@ -62,13 +67,21 @@ func checkBackpressure(ctx context.Context) (bool, int) {
 	now := float64(time.Now().Unix())
 	cutoff := now - float64(backpressureWindowSec)
 
-	// Clean old entries and count current
+	// Clean old entries and count current.
 	pipe := redisClient.Pipeline()
-	pipe.ZRemRangeByScore(ctx, backpressureKey, "-inf", fmt.Sprintf("%.0f", cutoff))
+	zremCmd := pipe.ZRemRangeByScore(ctx, backpressureKey, "-inf", fmt.Sprintf("%.0f", cutoff))
 	countCmd := pipe.ZCard(ctx, backpressureKey)
-	_, err := pipe.Exec(ctx)
-	if err != nil {
-		return true, 0 // fail-open
+	if _, err := pipe.Exec(ctx); err != nil {
+		log.Printf("[BACKPRESSURE] pipeline exec failed (fail-closed to soft limit): %v", err)
+		return false, maxPendingWorkflows
+	}
+	if err := zremCmd.Err(); err != nil {
+		log.Printf("[BACKPRESSURE] ZRemRangeByScore error (fail-closed): %v", err)
+		return false, maxPendingWorkflows
+	}
+	if err := countCmd.Err(); err != nil {
+		log.Printf("[BACKPRESSURE] ZCard error (fail-closed): %v", err)
+		return false, maxPendingWorkflows
 	}
 
 	depth := int(countCmd.Val())
@@ -135,51 +148,100 @@ func startQueueDrainLoop(ctx context.Context) {
 }
 
 // drainQueuedTasks processes up to maxDrain queued tasks per tick.
+//
+// Audit 1.20: this function used to run a plain SELECT + separate UPDATE, so two
+// API replicas racing on the drain tick would both see the same queued rows and
+// both publish the same task to Redpanda — producing duplicate investigations.
+// Now we use a single transaction with SELECT ... FOR UPDATE SKIP LOCKED +
+// UPDATE ... RETURNING so Postgres hands out each queued task to exactly one
+// replica. Publishes happen after the transaction commits so a Redpanda failure
+// is reverted by a cleanup UPDATE on a detached context.
 func drainQueuedTasks(ctx context.Context, maxDrain int) {
 	if dbPool == nil || tc == nil {
 		return
 	}
 
-	// Check if we have capacity
+	// Check if we have capacity.
 	allowed, _ := checkBackpressure(ctx)
 	if !allowed {
-		return // Still at capacity, wait
-	}
-
-	rows, err := dbPool.Query(ctx,
-		`SELECT id, tenant_id, task_type, input FROM agent_tasks
-		 WHERE status = 'queued'
-		 ORDER BY created_at ASC
-		 LIMIT $1`, maxDrain)
-	if err != nil {
 		return
 	}
-	defer rows.Close()
 
-	for rows.Next() {
-		var taskID, tenantID, taskType string
-		var input map[string]interface{}
-		if err := rows.Scan(&taskID, &tenantID, &taskType, &input); err != nil {
+	tx, err := dbPool.Begin(ctx)
+	if err != nil {
+		log.Printf("[DRAIN] begin tx failed: %v", err)
+		return
+	}
+	// defer rollback as a no-op after commit.
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Claim up to maxDrain queued tasks atomically: FOR UPDATE SKIP LOCKED lets
+	// other API replicas claim different rows concurrently without blocking.
+	claimRows, err := tx.Query(ctx,
+		`WITH claimed AS (
+		    SELECT id
+		      FROM agent_tasks
+		     WHERE status = 'queued'
+		     ORDER BY created_at ASC
+		     FOR UPDATE SKIP LOCKED
+		     LIMIT $1
+		)
+		UPDATE agent_tasks
+		   SET status = 'pending'
+		 WHERE id IN (SELECT id FROM claimed)
+		RETURNING id, tenant_id, task_type, input`,
+		maxDrain)
+	if err != nil {
+		log.Printf("[DRAIN] claim query failed: %v", err)
+		return
+	}
+
+	type claimedTask struct {
+		ID       string
+		TenantID string
+		TaskType string
+		Input    map[string]interface{}
+	}
+	var claimed []claimedTask
+	for claimRows.Next() {
+		var t claimedTask
+		if err := claimRows.Scan(&t.ID, &t.TenantID, &t.TaskType, &t.Input); err != nil {
+			log.Printf("[DRAIN] scan row failed: %v", err)
 			continue
 		}
+		claimed = append(claimed, t)
+	}
+	claimRows.Close()
 
-		// Re-check backpressure for each task
-		allowed, _ := checkBackpressure(ctx)
-		if !allowed {
-			break
+	if err := tx.Commit(ctx); err != nil {
+		log.Printf("[DRAIN] tx commit failed (claimed rows abandoned, still queued): %v", err)
+		return
+	}
+
+	// Post-commit publish. If publish fails we flip the row back to 'failed'
+	// via a detached context so a cancelled drain ctx can't swallow the write.
+	for _, t := range claimed {
+		// Re-check backpressure per task so a burst doesn't overwhelm Temporal.
+		if ok, _ := checkBackpressure(ctx); !ok {
+			// Roll the unused tasks back to queued so the next tick retries them.
+			cleanCtx, cleanCancel := detachedCleanupCtx()
+			_, _ = dbPool.Exec(cleanCtx, "UPDATE agent_tasks SET status = 'queued' WHERE id = $1", t.ID)
+			cleanCancel()
+			continue
 		}
 
 		pubCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-		err := publishTaskNew(pubCtx, tenantID, taskID, taskType, input)
+		err := publishTaskNew(pubCtx, t.TenantID, t.ID, t.TaskType, t.Input)
 		cancel()
 		if err != nil {
-			log.Printf("[DRAIN] Failed to publish queued task %s: %v", taskID, err)
-			_, _ = dbPool.Exec(ctx, "UPDATE agent_tasks SET status = 'failed' WHERE id = $1", taskID)
+			log.Printf("[DRAIN] failed to publish queued task %s: %v", t.ID, err)
+			cleanCtx, cleanCancel := detachedCleanupCtx()
+			_, _ = dbPool.Exec(cleanCtx, "UPDATE agent_tasks SET status = 'failed' WHERE id = $1", t.ID)
+			cleanCancel()
 			continue
 		}
 
-		_, _ = dbPool.Exec(ctx, "UPDATE agent_tasks SET status = 'pending' WHERE id = $1", taskID)
-		recordWorkflowStart(ctx, "task-"+taskID)
-		log.Printf("[DRAIN] Published queued task %s (type=%s) to Redpanda", taskID, taskType)
+		recordWorkflowStart(ctx, "task-"+t.ID)
+		log.Printf("[DRAIN] published queued task %s (type=%s) to Redpanda", t.ID, t.TaskType)
 	}
 }

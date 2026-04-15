@@ -47,11 +47,10 @@ def _suppression_pattern_matched(patterns: list, text: str, tenant_id: str, rule
                 pass
     return False
 ZOVARK_LLM_ENDPOINT = os.environ.get("ZOVARK_LLM_ENDPOINT", "http://zovark-inference:8080/v1/chat/completions")
-try:
-    from settings import settings as _settings
-    ZOVARK_LLM_KEY = os.environ.get("ZOVARK_LLM_KEY", _settings.llm_key.get_secret_value())
-except ImportError:
-    ZOVARK_LLM_KEY = os.environ.get("ZOVARK_LLM_KEY", "sk-zovark-dev-2026")
+# stabilize-runtime-hygiene: LLM key loading is centralized on settings.llm_key.
+# No hardcoded fallback — Pydantic raises ValidationError if ZOVARK_LLM_KEY is unset.
+from settings import settings as _settings
+ZOVARK_LLM_KEY = _settings.llm_key.get_secret_value()
 ASSESS_SUMMARY_TIMEOUT = float(os.getenv("ZOVARK_ASSESS_TIMEOUT", "45"))
 
 
@@ -250,8 +249,12 @@ def _extract_iocs_from_signals(siem_event: dict, stdout: str, prompt: str = "") 
             seen.add(h.lower())
 
     # Domains
+    # Audit 2.16: cap combined_text before applying the domain regex.
+    # The previous pattern is ReDoS-prone on adversarial inputs ("a-a-a-a-..." x N);
+    # bounding the scan window to 32 KB keeps worst-case linear.
     domain_tlds = r'(?:com|net|org|io|xyz|ru|cn|tk|info|biz|top|cc|pw|ws|club|site|online|live|me|co|op)'
-    for domain in re.findall(rf'\b([a-zA-Z0-9](?:[a-zA-Z0-9-]{{0,61}}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{{0,61}}[a-zA-Z0-9])?)*\.{domain_tlds})\b', combined_text):
+    _domain_scan_text = combined_text[:32768]
+    for domain in re.findall(rf'\b([a-zA-Z0-9](?:[a-zA-Z0-9-]{{0,61}}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{{0,61}}[a-zA-Z0-9])?)*\.{domain_tlds})\b', _domain_scan_text):
         if domain.lower() not in seen and len(domain) > 4:
             iocs.append({
                 "type": "domain", "value": domain.lower(), "context": "domain extracted from log/analysis",
@@ -286,11 +289,8 @@ def _fp_confidence(risk_score: int, ioc_count: int) -> float:
 
 
 # --- Validation failure logging ---
-try:
-    from settings import settings as _settings_db
-    DATABASE_URL = os.environ.get("DATABASE_URL", _settings_db.database_url)
-except ImportError:
-    DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://zovark:hydra_dev_2026@pgbouncer:5432/zovark")
+# stabilize-runtime-hygiene: centralized DB URL via settings.
+DATABASE_URL = os.environ.get("DATABASE_URL", _settings.database_url)
 
 
 def _log_validation_failure(task_id: str, tenant_id: str, task_type: str, error_msg: str):
@@ -385,7 +385,30 @@ async def assess_results(data: dict) -> dict:
     Input: ExecuteOutput fields + task metadata
     Returns: dict (serializable AssessOutput fields)
     """
-    # OTEL span
+    # OTEL span — audit 2.17: guarantee span.end() runs on every exit path
+    # (happy-path return AND exception). assess_results is a long function with
+    # multiple early returns; wrapping the whole body in try/finally would
+    # require re-indenting hundreds of lines. Instead we attach a SpanGuard to a
+    # local variable whose CPython refcount hits zero on function frame exit,
+    # at which point __del__ ends the span exactly once.
+    class _SpanGuard:
+        __slots__ = ("span", "done")
+
+        def __init__(self, s):
+            self.span = s
+            self.done = False
+
+        def finish(self):
+            if self.span is not None and not self.done:
+                self.done = True
+                try:
+                    self.span.end()
+                except Exception:
+                    pass
+
+        def __del__(self):
+            self.finish()
+
     try:
         from tracing import get_tracer
         _span = get_tracer().start_span("stage.assess")
@@ -394,6 +417,7 @@ async def assess_results(data: dict) -> dict:
         _span.set_attribute("zovark.execution_mode", data.get("execution_mode", ""))
     except Exception:
         _span = None
+    _span_guard = _SpanGuard(_span)  # noqa: F841 — held so __del__ runs on exit
 
     task_id = data.get("task_id", "")
     tenant_id = data.get("tenant_id", "")
@@ -519,6 +543,11 @@ async def assess_results(data: dict) -> dict:
             existing_by_value[val] = new_ioc
 
     # --- IOC provenance validation (Red team patch: prevents phantom IP fabrication) ---
+    # Audit 2.15: use word-boundary regex for ALL IOC types, not just substring
+    # contains. Previously "192.168.1.10" was "confirmed" when raw_log contained
+    # only "192.168.1.100", and "admin" was confirmed by raw_log containing
+    # "administrator" — both are provenance bypasses.
+    raw_log_lower = raw_log.lower() if raw_log else ""
     if raw_log:
         for ioc in iocs:
             if not isinstance(ioc, dict):
@@ -526,11 +555,12 @@ async def assess_results(data: dict) -> dict:
             value = str(ioc.get("value", ""))
             if not value:
                 continue
-            # Check if IOC value appears in raw_log
-            if ioc.get("type") in ("ipv4", "ip", "ip_address"):
-                value_in_raw = bool(re.search(re.escape(value), raw_log))
-            else:
-                value_in_raw = value.lower() in raw_log.lower()
+            # Compose a word-boundary pattern that also works for IPs (. separator).
+            escaped = re.escape(value)
+            value_in_raw = bool(
+                re.search(r'(?<![A-Za-z0-9_.])' + escaped + r'(?![A-Za-z0-9_.])',
+                          raw_log_lower, re.IGNORECASE)
+            )
 
             if value_in_raw:
                 ioc.setdefault("confidence", "high")
@@ -704,9 +734,13 @@ async def assess_results(data: dict) -> dict:
             validated = VerdictOutput.model_validate(verdict_for_validation)
             # Apply cleaned MITRE techniques back (invalid IDs silently dropped)
             out["mitre_attack_validated"] = validated.mitre_techniques
-    except (ImportError, Exception) as e:
-        if not isinstance(e, ImportError):
-            activity.logger.warning(f"Verdict validation issue (non-fatal): {e}")
+    except ImportError:
+        # Pydantic / schemas module not importable — optional validation.
+        pass
+    except Exception as e:  # noqa: BLE001 — ValidationError / value errors are logged but non-fatal
+        # Audit 2.18: split broad (ImportError, Exception) so pydantic
+        # ValidationError is logged distinctly and surfaced via metrics.
+        activity.logger.warning(f"Verdict validation issue (non-fatal): {e}")
 
     technique_ids: list[str] = []
     if out.get("mitre_attack_validated"):
@@ -731,14 +765,16 @@ async def assess_results(data: dict) -> dict:
         activity.logger.warning(f"compliance_mapping skipped: {cm_err}")
         out["compliance_mapping"] = {}
 
-    # End OTEL span
+    # Annotate OTEL span with final verdict attributes. _SpanGuard.finish()
+    # (via __del__) will end() the span on frame exit — both success and any
+    # upstream exception paths.
     if _span:
         try:
             _span.set_attribute("result.verdict", verdict)
             _span.set_attribute("result.risk_score", risk_score)
             _span.set_attribute("result.ioc_count", len(iocs))
-            _span.end()
         except Exception:
             pass
+    _span_guard.finish()
 
     return out

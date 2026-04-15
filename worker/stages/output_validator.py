@@ -9,10 +9,14 @@ Used by: stages/assess.py (post-LLM validation)
 from typing import Tuple
 
 
-# Valid verdicts that the pipeline can produce
+# Valid verdicts that the pipeline can produce.
+# Audit 2.26: include "needs_analyst_review" and "error" which assess.py
+# produces on fail-closed / validator-override paths. Previously the validator
+# rejected them as "unknown", silently downgrading real flagged investigations.
 VALID_VERDICTS = {
     "true_positive", "false_positive", "suspicious", "needs_review",
-    "benign", "needs_manual_review", "inconclusive",
+    "benign", "needs_manual_review", "needs_analyst_review",
+    "inconclusive", "error",
 }
 
 

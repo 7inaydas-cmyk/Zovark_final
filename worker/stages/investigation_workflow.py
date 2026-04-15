@@ -9,9 +9,8 @@ Stages:
   4.5 GOVERN (10s)  — autonomy check
   5. STORE   (30s)  — DB writes, memory, patterns
 """
-import time
 from datetime import timedelta
-from temporalio import workflow
+from temporalio import workflow  # noqa: F401 — re-exported by stages/__init__
 
 with workflow.unsafe.imports_passed_through():
     from stages.ingest import ingest_alert
@@ -22,8 +21,14 @@ with workflow.unsafe.imports_passed_through():
     from stages.store import store_investigation
 
 
-@workflow.defn
-class InvestigationWorkflowV2:
+# Wire-name preservation: the Temporal workflow type string remains
+# "InvestigationWorkflowV2" for backwards compatibility with in-flight workflows
+# and every caller that passes the string as `ZOVARK_WORKFLOW_VERSION`. The
+# Python class symbol is `InvestigationWorkflow` (the "V2" suffix was a
+# historical naming artifact — this IS the current investigation pipeline).
+# See openspec/changes/stabilize-runtime-hygiene/design.md Decision 1.
+@workflow.defn(name="InvestigationWorkflowV2")
+class InvestigationWorkflow:
     """6-stage investigation pipeline with tracing."""
 
     @workflow.run

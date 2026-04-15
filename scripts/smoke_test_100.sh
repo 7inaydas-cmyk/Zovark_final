@@ -1,12 +1,21 @@
 #!/bin/bash
 # ZOVARK 100-Alert Smoke Test — API-based (the correct way)
 # Submits 100 alerts through the API, waits, polls results.
-set -u
+#
+# Audit 5.19: strict shell (set -euo pipefail), curl -fsS so HTTP errors fail
+# the pipe, jq-based JSON parsing (substring grep misleads on nested fields),
+# and a non-zero exit code when any assertion fails.
+set -euo pipefail
 MSYS_NO_PATHCONV=1
 
-API="http://localhost:8090"
+if ! command -v jq >/dev/null 2>&1; then
+    echo "ERROR: jq is required but not installed (apt: jq / brew: jq)" >&2
+    exit 2
+fi
+
+API="${ZOVARK_API_BASE:-http://localhost:8090}"
 TMPDIR=$(mktemp -d)
-trap "rm -rf $TMPDIR" EXIT
+trap 'rm -rf "$TMPDIR"' EXIT
 
 echo "=========================================="
 echo "  ZOVARK 100-ALERT SMOKE TEST"
@@ -16,22 +25,24 @@ echo ""
 
 # --- Step 1: Health check ---
 echo "[1/5] Health check..."
-READY=$(curl -s "$API/ready" 2>/dev/null)
-if echo "$READY" | grep -q '"status":"ready"'; then
-    echo "  API is ready."
-else
-    echo "  ERROR: API not ready: $READY"
+if ! READY=$(curl -fsS "$API/ready" 2>&1); then
+    echo "  ERROR: /ready unreachable: $READY" >&2
     exit 1
 fi
+if ! echo "$READY" | jq -e '.status == "ready"' >/dev/null; then
+    echo "  ERROR: API not ready: $READY" >&2
+    exit 1
+fi
+echo "  API is ready."
 
 # --- Step 2: Login (ONCE) ---
 echo "[2/5] Authenticating..."
-LOGIN_RESP=$(curl -s -X POST "$API/api/v1/auth/login" \
+LOGIN_RESP=$(curl -fsS -X POST "$API/api/v1/auth/login" \
     -H "Content-Type: application/json" \
-    -d '{"email":"admin@test.local","password":"TestPass2026"}' 2>/dev/null)
-TOKEN=$(echo "$LOGIN_RESP" | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
+    -d '{"email":"admin@test.local","password":"TestPass2026"}')
+TOKEN=$(echo "$LOGIN_RESP" | jq -r '.token // empty')
 if [ -z "$TOKEN" ] || [ ${#TOKEN} -lt 20 ]; then
-    echo "  ERROR: Login failed: $LOGIN_RESP"
+    echo "  ERROR: Login failed: $LOGIN_RESP" >&2
     exit 1
 fi
 echo "  Authenticated."
@@ -39,20 +50,28 @@ echo "  Authenticated."
 # --- Step 3: Define and submit 100 alerts ---
 echo "[3/5] Submitting 100 alerts..."
 
-# Function to submit an alert and save the task_id
+# Function to submit an alert and save the task_id. Uses jq -n to build the
+# JSON body so special characters in RAW/TITLE don't break curl.
 submit() {
     local IDX=$1 TYPE=$2 SEV=$3 TITLE=$4 RULE=$5 RAW=$6 SRC_IP=$7 USER=$8 EXPECT=$9
-    local RESP TID
-    RESP=$(curl -s -X POST "$API/api/v1/tasks" \
+    local RESP TID BODY
+    BODY=$(jq -cn \
+        --arg type "$TYPE" --arg title "$TITLE" --arg sev "$SEV" \
+        --arg src "$SRC_IP" --arg u "$USER" --arg rule "$RULE" --arg raw "$RAW" \
+        '{task_type: $type, input: {prompt: $title, severity: $sev, siem_event: {title: $title, source_ip: $src, username: $u, rule_name: $rule, raw_log: $raw}}}')
+    if RESP=$(curl -fsS -X POST "$API/api/v1/tasks" \
         -H "Authorization: Bearer $TOKEN" \
         -H "Content-Type: application/json" \
-        -d "{\"task_type\":\"$TYPE\",\"input\":{\"prompt\":\"$TITLE\",\"severity\":\"$SEV\",\"siem_event\":{\"title\":\"$TITLE\",\"source_ip\":\"$SRC_IP\",\"username\":\"$USER\",\"rule_name\":\"$RULE\",\"raw_log\":\"$RAW\"}}}" 2>/dev/null || echo '{"error":"curl_failed"}')
-    TID=$(echo "$RESP" | grep -o '"task_id":"[^"]*"' | cut -d'"' -f4 || true)
+        -d "$BODY" 2>&1); then
+        TID=$(echo "$RESP" | jq -r '.task_id // empty' 2>/dev/null || true)
+    else
+        TID=""
+        echo "  WARNING: Alert $IDX ($TYPE) HTTP submit failed: $(echo "$RESP" | head -c 200)" >&2
+    fi
     if [ -n "$TID" ] && [ ${#TID} -gt 10 ]; then
         echo "$IDX|$TYPE|$EXPECT|$TID" >> "$TMPDIR/tasks.txt"
     else
         echo "$IDX|$TYPE|$EXPECT|SUBMIT_FAILED" >> "$TMPDIR/tasks.txt"
-        echo "  WARNING: Alert $IDX ($TYPE) submit failed: $(echo $RESP | head -c 100)" >&2
     fi
 }
 
@@ -222,10 +241,16 @@ while IFS='|' read -r IDX TYPE EXPECT TID; do
         continue
     fi
 
-    RAW=$(curl -s "http://localhost:8090/api/v1/tasks/$TID" -H "Authorization: Bearer $TOKEN" 2>/dev/null)
-    STATUS=$(echo "$RAW" | grep -o '"status":"[^"]*"' | head -1 | cut -d'"' -f4)
-    VERDICT=$(echo "$RAW" | grep -o '"verdict":"[^"]*"' | tail -1 | cut -d'"' -f4)
-    RISK=$(echo "$RAW" | grep -o '"risk_score":[0-9]*' | tail -1 | cut -d: -f2)
+    if ! RAW=$(curl -fsS "$API/api/v1/tasks/$TID" -H "Authorization: Bearer $TOKEN" 2>&1); then
+        printf "%-4s %-25s | %-7s | POLL_FAILED\n" "$IDX." "$TYPE" "$EXPECT" >> "$TMPDIR/results.txt"
+        FAIL=$((FAIL + 1))
+        if [ "$EXPECT" = "attack" ]; then ATTACK_FAIL=$((ATTACK_FAIL + 1)); else BENIGN_FAIL=$((BENIGN_FAIL + 1)); fi
+        continue
+    fi
+    STATUS=$(echo "$RAW" | jq -r '.status // ""')
+    # jq 'first non-null verdict / risk_score in top-level or output blob'
+    VERDICT=$(echo "$RAW" | jq -r '.output.verdict // .verdict // ""')
+    RISK=$(echo "$RAW" | jq -r '.output.risk_score // .risk_score // empty')
 
     if [ "$STATUS" != "completed" ]; then
         printf "%-4s %-25s | %-7s | PENDING (status=%s)\n" "$IDX." "$TYPE" "$EXPECT" "$STATUS" >> "$TMPDIR/results.txt"
@@ -291,3 +316,10 @@ echo "  Detection Rate:     ${DETECTION_RATE}%"
 echo "  False Positive Rate: ${FP_RATE}%"
 echo ""
 echo "=========================================="
+
+# Audit 5.19: exit non-zero if anything failed, so CI correctly fails the job.
+if [ "$FAIL" -gt 0 ]; then
+    echo "FAILED: $FAIL alerts did not meet expected verdict/risk." >&2
+    exit 1
+fi
+exit 0

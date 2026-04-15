@@ -61,12 +61,23 @@ func healthCheckHandler(c *gin.Context) {
 	if llmKey == "" {
 		llmKey = strings.TrimSpace(getEnvOrDefault("OPENAI_API_KEY", ""))
 	}
+	// Per-call short-deadline client — http.Get() uses DefaultClient with no timeout
+	// which would block /health forever if the LLM/embedding backend hangs.
+	hcClient := &http.Client{Timeout: 3 * time.Second}
+	getWithTimeout := func(u string) (*http.Response, error) {
+		req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodGet, u, nil)
+		if err != nil {
+			return nil, err
+		}
+		return hcClient.Do(req)
+	}
+
 	if llmProviderEnv == "openai" {
 		llmOK = checkOpenAIReachable(llmEndpoint, llmKey)
 	} else {
 		// Derive health URL from chat completions endpoint (llama.cpp)
 		llmHealthURL := strings.TrimSuffix(llmEndpoint, "/v1/chat/completions") + "/health"
-		resp, err := http.Get(llmHealthURL)
+		resp, err := getWithTimeout(llmHealthURL)
 		if err == nil {
 			llmOK = (resp.StatusCode == 200)
 			resp.Body.Close()
@@ -74,7 +85,7 @@ func healthCheckHandler(c *gin.Context) {
 		if !llmOK {
 			// Fallback: try /api/tags (legacy compatibility)
 			llmTagsURL := strings.TrimSuffix(llmEndpoint, "/v1/chat/completions") + "/api/tags"
-			resp, err = http.Get(llmTagsURL)
+			resp, err = getWithTimeout(llmTagsURL)
 			if err == nil {
 				llmOK = (resp.StatusCode == 200)
 				resp.Body.Close()
@@ -84,7 +95,7 @@ func healthCheckHandler(c *gin.Context) {
 
 	// Check embedding server
 	embeddingOK := false
-	embResp, embErr := http.Get("http://embedding-server:80/health")
+	embResp, embErr := getWithTimeout("http://embedding-server:80/health")
 	if embErr == nil {
 		embeddingOK = (embResp.StatusCode == 200)
 		embResp.Body.Close()
