@@ -1,3 +1,22 @@
+> ### Archived snapshot, not the current codebase
+>
+> This repository is an April 2026 snapshot of the Zovark v1.5.1 prototype. It is kept
+> because the decision history is worth reading. Nothing here has been maintained since.
+>
+> **The current work lives in two repositories:**
+>
+> | Repository | What it is |
+> |---|---|
+> | **[zovark-runtime](https://github.com/7inaydas-cmyk/zovark-runtime)** | The go-forward runtime. Eight slices shipped, 343 tests, an offline verifier that re-derives the verdict from evidence and fails closed, and a reproducible SHA-256 anchor published in the README that you can check yourself in five minutes. |
+> | **[zovark-architecture](https://github.com/7inaydas-cmyk/zovark-architecture)** | The architecture authority. 27 decision records, a register of 39 invariants each marked covered, partial or deferred, and 510 tests. |
+>
+> Start with [zovark-runtime](https://github.com/7inaydas-cmyk/zovark-runtime) if you want
+> to run something. Start with
+> [zovark-architecture](https://github.com/7inaydas-cmyk/zovark-architecture) if you want to
+> read why it is built the way it is.
+
+---
+
 # ZOVARK Documentation
 
 **Version:** v1.5.1 | **Date:** 2026-03-24
